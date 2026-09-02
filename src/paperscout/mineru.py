@@ -9,9 +9,11 @@ import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -63,16 +65,32 @@ def _request_json(method: str, url: str, payload: dict[str, Any] | None, token: 
 
 def _upload_file(file_path: Path, upload_url: str, timeout: float) -> None:
     # MinerU explicitly asks clients not to set Content-Type on this signed PUT.
-    request = Request(upload_url, data=file_path.read_bytes(), method="PUT")
+    parsed_url = urlsplit(upload_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+        raise MinerUAPIError("MinerU returned an invalid signed upload URL")
+    connection_type = HTTPSConnection if parsed_url.scheme == "https" else HTTPConnection
+    connection = connection_type(parsed_url.hostname, parsed_url.port, timeout=timeout)
+    request_target = parsed_url.path or "/"
+    if parsed_url.query:
+        request_target += f"?{parsed_url.query}"
     try:
-        with urlopen(request, timeout=timeout) as response:
-            if response.status not in (200, 201, 204):
-                raise MinerUAPIError(f"MinerU upload returned HTTP {response.status}")
+        connection.putrequest("PUT", request_target, skip_accept_encoding=True)
+        connection.putheader("Content-Length", str(file_path.stat().st_size))
+        connection.endheaders()
+        with file_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                connection.send(chunk)
+        response = connection.getresponse()
+        detail = response.read().decode("utf-8", errors="replace")
+        if response.status not in (200, 201, 204):
+            raise MinerUAPIError(f"MinerU upload returned HTTP {response.status}: {detail[:500]}")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise MinerUAPIError(f"MinerU upload failed with HTTP {exc.code}: {detail[:500]}") from exc
-    except URLError as exc:
-        raise MinerUAPIError(f"MinerU upload failed: {exc.reason}") from exc
+    except (HTTPException, OSError) as exc:
+        raise MinerUAPIError(f"MinerU upload failed: {exc}") from exc
+    finally:
+        connection.close()
 
 
 def _download_file(download_url: str, destination: Path, timeout: float) -> None:

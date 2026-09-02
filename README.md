@@ -22,6 +22,28 @@ uv sync
 uv run pytest
 ```
 
+## `.env` 配置
+
+项目会自动读取项目根目录下的 `.env` 文件。可以复制 `.env.example` 为 `.env`，然后填写真实配置：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+`.env` 中可以配置 MinerU 和真实 LLM：
+
+```dotenv
+MINERU_TOKEN=<你的 MinerU API Token>
+PAPERSCOUT_LLM_API_KEY=<你的 LLM API Key>
+PAPERSCOUT_LLM_BASE_URL=https://deepsy.top/v1
+PAPERSCOUT_LLM_MODEL=gpt-5.4-mini
+PAPERSCOUT_LLM_REASONING_EFFORT=high
+PAPERSCOUT_LLM_DISABLE_RESPONSE_STORAGE=true
+PAPERSCOUT_LLM_WIRE_API=responses
+```
+
+真实 `.env` 已加入 `.gitignore`，不会提交到远程仓库。`.env` 中的 `MINERU_TOKEN` 用于 MinerU 解析，`PAPERSCOUT_LLM_API_KEY` 用于真实 Ingest Agent，两者不能混用。
+
 ## MinerU 精准解析配置
 
 使用精准解析 API 前，需要设置 MinerU API Token：

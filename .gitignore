@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.env
 
 # Runtime data is intentionally separate from source code.
 raw/
