@@ -10,6 +10,25 @@ from typing import Any
 from .models import Artifact, RunEvent
 
 
+def llmwiki_workspace(project_root: Path) -> Path:
+    """Return the persistent LLM Wiki root for a PaperScout project."""
+    return project_root.expanduser().resolve() / "llmwiki"
+
+
+def reset_test_workspace(project_root: Path) -> Path:
+    """Clear and recreate the project-local ``llmwiki/test`` workspace."""
+    project_root = project_root.expanduser().resolve()
+    if not project_root.is_dir():
+        raise FileNotFoundError(f"Project root does not exist: {project_root}")
+    workspace = llmwiki_workspace(project_root) / "test"
+    if workspace.exists():
+        if not workspace.is_dir() or workspace.is_symlink():
+            raise ValueError(f"Test workspace is not a normal directory: {workspace}")
+        shutil.rmtree(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

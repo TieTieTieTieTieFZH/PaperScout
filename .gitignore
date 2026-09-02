@@ -9,3 +9,5 @@ __pycache__/
 raw/
 wiki/
 runs/
+llmwiki/
+tests/

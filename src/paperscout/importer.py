@@ -50,7 +50,7 @@ def _infer_authors(full_text: str) -> list[str]:
 
 def import_preparsed(
     workspace: Path,
-    mineru_dir: Path,
+    mineru_path: Path,
     source_pdf: Path | None = None,
     paper_id: str | None = None,
     title: str | None = None,
@@ -59,23 +59,23 @@ def import_preparsed(
     task_metadata: dict | None = None,
 ) -> ImportedPaper:
     """Normalize a user-supplied PDF and MinerU output into the immutable raw layer."""
-    mineru_dir = mineru_dir.expanduser().resolve()
-    if not mineru_dir.is_dir():
-        raise FileNotFoundError(f"MinerU directory does not exist: {mineru_dir}")
+    mineru_path = mineru_path.expanduser().resolve()
+    if not mineru_path.is_dir():
+        raise FileNotFoundError(f"MinerU directory does not exist: {mineru_path}")
 
-    full_md = _first_file(mineru_dir, ["full.md", "*.md"])
-    content_list = _first_file(mineru_dir, ["content_list.json", "*_content_list.json"])
+    full_md = _first_file(mineru_path, ["full.md", "*.md"])
+    content_list = _first_file(mineru_path, ["content_list.json", "*_content_list.json"])
     if not full_md or not content_list:
         raise FileNotFoundError("Preparsed input requires full.md and content_list.json")
 
     if source_pdf is None:
-        source_pdf = _first_file(mineru_dir, ["source.pdf", "*_origin.pdf", "*.pdf"])
+        source_pdf = _first_file(mineru_path, ["source.pdf", "*_origin.pdf", "*.pdf"])
     if not source_pdf or not source_pdf.is_file():
         raise FileNotFoundError("A source PDF is required for the immutable raw layer")
     source_pdf = source_pdf.expanduser().resolve()
 
     full_text = full_md.read_text(encoding="utf-8")
-    resolved_id = paper_id or _infer_paper_id(full_text, mineru_dir)
+    resolved_id = paper_id or _infer_paper_id(full_text, mineru_path)
     raw_dir = FileSystemStore(workspace).paper_raw_dir(resolved_id)
     if raw_dir.exists():
         raise FileExistsError(f"Raw paper already exists: {raw_dir}")
@@ -99,19 +99,19 @@ def import_preparsed(
     for source, destination in canonical.items():
         safe_copy(source, destination)
     for pattern, destination_name in optional_patterns.items():
-        source = _first_file(mineru_dir, [pattern])
+        source = _first_file(mineru_path, [pattern])
         if source:
             safe_copy(source, raw_mineru / destination_name)
 
-    images = mineru_dir / "images"
+    images = mineru_path / "images"
     if images.is_dir():
         shutil.copytree(images, raw_mineru / "images")
 
     # Preserve other non-PDF MinerU artifacts without making them part of the required contract.
     extras = raw_mineru / "extra"
     known = {full_md.resolve(), content_list.resolve()}
-    known.update(path.resolve() for path in [mineru_dir / "images"] if path.exists())
-    for source in mineru_dir.iterdir():
+    known.update(path.resolve() for path in [mineru_path / "images"] if path.exists())
+    for source in mineru_path.iterdir():
         if source.is_file() and source.suffix.lower() != ".pdf" and source.resolve() not in known:
             if source.name in {destination.name for destination in canonical.values()}:
                 continue
@@ -142,7 +142,7 @@ def import_preparsed(
     write_json(
         raw_mineru / "import_manifest.json",
         {
-            "source_directory": str(mineru_dir),
+            "source_directory": str(mineru_path),
             "source_pdf": str(source_pdf),
             "files": sorted(str(path.relative_to(raw_mineru)) for path in raw_mineru.rglob("*") if path.is_file()),
             "source_pdf_sha256": source_hash,

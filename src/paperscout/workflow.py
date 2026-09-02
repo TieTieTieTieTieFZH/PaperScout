@@ -134,7 +134,7 @@ def _new_run(store: FileSystemStore, mode: str, paper_id: str, question: str | N
 
 def run_ingest(
     workspace: Path,
-    mineru_dir: Path | None = None,
+    mineru_path: Path | None = None,
     source_pdf: Path | None = None,
     paper_id: str | None = None,
     title: str | None = None,
@@ -142,27 +142,23 @@ def run_ingest(
     year: int | None = None,
     llm_mode: str = "mock",
     *,
-    mineru_path: Path | None = None,
     mineru_token: str | None = None,
 ) -> dict[str, Any]:
     """Ingest a paper from local MinerU output or, when omitted, the precise API."""
     store = FileSystemStore(workspace)
-    if mineru_dir is not None and mineru_path is not None:
-        raise ValueError("Pass only one of mineru_dir and mineru_path")
-    selected_mineru_path = mineru_path or mineru_dir
     parsed_task: dict[str, Any] | None = None
-    temporary_mineru_dir: Path | None = None
-    if selected_mineru_path is None:
+    temporary_mineru_path: Path | None = None
+    if mineru_path is None:
         if source_pdf is None:
             raise ValueError("source_pdf is required when mineru_path is not provided")
-        temporary_mineru_dir = Path(tempfile.mkdtemp(prefix="paperscout-mineru-"))
+        temporary_mineru_path = Path(tempfile.mkdtemp(prefix="paperscout-mineru-"))
         try:
-            parsed = parse_with_mineru_api(source_pdf, temporary_mineru_dir, token=mineru_token)
-            selected_mineru_path = parsed.output_dir
+            parsed = parse_with_mineru_api(source_pdf, temporary_mineru_path, token=mineru_token)
+            mineru_path = parsed.output_dir
             parsed_task = parsed.task_metadata
             imported = import_preparsed(
                 workspace,
-                selected_mineru_path,
+                mineru_path,
                 source_pdf,
                 paper_id,
                 title,
@@ -171,9 +167,9 @@ def run_ingest(
                 task_metadata=parsed_task,
             )
         finally:
-            shutil.rmtree(temporary_mineru_dir, ignore_errors=True)
+            shutil.rmtree(temporary_mineru_path, ignore_errors=True)
     else:
-        imported = import_preparsed(workspace, selected_mineru_path, source_pdf, paper_id, title, authors, year)
+        imported = import_preparsed(workspace, mineru_path, source_pdf, paper_id, title, authors, year)
     state = _new_run(store, llm_mode, imported.paper_id)
     graph = _build_ingest_graph(store, _provider(llm_mode))
     final = graph.invoke(state)
