@@ -1,0 +1,11 @@
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime data is intentionally separate from source code.
+raw/
+wiki/
+runs/
