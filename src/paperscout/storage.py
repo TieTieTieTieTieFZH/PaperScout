@@ -80,15 +80,37 @@ class FileSystemStore:
         return artifact
 
     def publish_staged_wiki(self, run_id: str) -> None:
+        """Replace the complete Wiki snapshot, never copy individual live files."""
         staged = self.staging_wiki_dir(run_id)
         if not staged.exists():
             raise FileNotFoundError(f"No staged wiki found for run {run_id}")
-        self.wiki.mkdir(parents=True, exist_ok=True)
-        for source in staged.rglob("*"):
-            if source.is_file():
-                destination = self.wiki / source.relative_to(staged)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, destination)
+        if not staged.is_dir() or staged.is_symlink():
+            raise ValueError("Staged wiki must be a normal directory")
+        backup = self.run_dir(run_id) / "published-wiki-backup"
+        if backup.exists():
+            raise FileExistsError(f"Backup already exists for run {run_id}")
+        if self.wiki.exists():
+            os.replace(self.wiki, backup)
+        try:
+            os.replace(staged, self.wiki)
+        except Exception:
+            if backup.exists() and not self.wiki.exists():
+                os.replace(backup, self.wiki)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+
+    def prepare_staging_wiki(self, run_id: str) -> Path:
+        """Create a complete candidate snapshot, preserving published index entries."""
+        staged = self.staging_wiki_dir(run_id)
+        if staged.exists():
+            raise FileExistsError(f"Staging wiki already exists for run {run_id}")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if self.wiki.exists():
+            shutil.copytree(self.wiki, staged)
+        else:
+            staged.mkdir(parents=True)
+        return staged
 
     def write_result(self, run_id: str, result: dict[str, Any]) -> None:
         write_json(self.run_dir(run_id) / "result.json", result)

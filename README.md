@@ -4,12 +4,12 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 
 ## 当前功能
 
-- 支持 Python 3.11、`uv`、LangGraph 和 Pydantic。
-- 包含三个流程节点：`wiki_ingest`、`retrieval_qa` 和 `review`。
+- 支持 Python 3.11、`uv` 和 Pydantic。
+- 包含 Wiki Ingest 与 Retrieval QA 两个 Agent 流程；发布与引用检查由宿主确定性执行。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
-- 通过 JSONL 索引进行关键词检索，暂不依赖数据库或向量数据库。
+- 先检索论文 summaries，再加载其中显式关联的 JSONL evidence，暂不依赖数据库或向量数据库。
 - 测试默认使用确定性的 Mock LLM。
 - 提供 OpenAI 兼容 Responses 接口适配器，但当前测试不会调用真实 LLM。
 - 暂无命令行接口，Python API 是当前主要集成入口。
@@ -35,14 +35,13 @@ Copy-Item .env.example .env
 ```dotenv
 MINERU_TOKEN=<你的 MinerU API Token>
 PAPERSCOUT_LLM_API_KEY=<你的 LLM API Key>
-PAPERSCOUT_LLM_BASE_URL=https://deepsy.top/v1
+PAPERSCOUT_LLM_BASE_URL=https://ai.input.im/v1
 PAPERSCOUT_LLM_MODEL=gpt-5.4-mini
 PAPERSCOUT_LLM_REASONING_EFFORT=high
 PAPERSCOUT_LLM_DISABLE_RESPONSE_STORAGE=true
 PAPERSCOUT_LLM_WIRE_API=responses
+INGEST_LLM_CONTEXT_WINDOW=128000
 ```
-
-真实 `.env` 已加入 `.gitignore`，不会提交到远程仓库。`.env` 中的 `MINERU_TOKEN` 用于 MinerU 解析，`PAPERSCOUT_LLM_API_KEY` 用于真实 Ingest Agent，两者不能混用。
 
 ## MinerU 精准解析配置
 
@@ -61,6 +60,14 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 3. 轮询精准解析任务状态；
 4. 下载并解压解析结果 ZIP；
 5. 将 `full.md`、`content_list.json` 及其他解析文件导入 `raw/` 层。
+
+## 三种工作流
+
+- **PDF → raw**：调用 `run_ingest(..., llm_mode="mock" | "real")` 并提供 PDF/MinerU 输入；它先将 PDF 与 MinerU 结果导入不可变的 `raw/`。
+- **raw → Wiki**：调用 `run_ingest_from_raw()`；它只读取已有的 `raw/papers/{paper_id}/metadata.json` 与 `mineru/content_list.json`，不会调用 MinerU、复制 PDF、修改或删除 raw。
+- **PDF → raw → Wiki**：`run_ingest()` 完成导入后复用与 `run_ingest_from_raw()` 相同的校验、渲染和发布流程。
+
+宿主只使用当前论文的 `mineru/content_list.json` 生成带 evidence ID、页码和章节的可引用 Markdown。短论文会随首个请求内联；长论文通过受限 `read_raw` 读取内存中的 `mineru/citable-evidence.md`。Ingest Agent 直接输出五栏 Markdown 摘要及 evidence 标记，不能选择 Wiki 路径或写入文件。
 
 ## Python API
 
@@ -85,6 +92,23 @@ answer = run_qa(
     llm_mode="mock",
 )
 ```
+
+### 从已存在 raw 生成 Wiki
+
+```python
+from pathlib import Path
+from paperscout.workflow import run_ingest_from_raw
+
+run_ingest_from_raw(
+    workspace=Path("./paper-workspace"),
+    paper_id="paper_001",
+    llm_mode="real",
+)
+```
+
+如果同一 `paper_id` 已有摘要、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。发布时会对完整 staging Wiki 执行本地规则审核，审核失败不会向 `wiki/` 发布任何文件。
+
+升级已有 Wiki 时，执行一次 `migrate_wiki(workspace)`；它会在 staging 中移除旧的概念与 chunks 产物，再通过健康检查后原子发布。
 
 ### 自动调用 MinerU 精准解析
 
@@ -118,7 +142,7 @@ llmwiki/
 │   ├── evidence/
 │   ├── indexes/
 │   ├── summaries/
-│   └── concepts/
+│   └── health/
 └── runs/
     └── {run_id}/
         ├── state.json

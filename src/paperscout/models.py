@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def utc_now() -> datetime:
@@ -41,6 +41,52 @@ class Citation(BaseModel):
     evidence_id: str
     page: int
     quote: str
+
+
+class ReadRawToolArguments(BaseModel):
+    """Bounded arguments for the read-only raw tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    offset_chars: int = Field(default=0, ge=0)
+    max_chars: int = Field(default=0, ge=0)
+
+
+class AgentToolCall(BaseModel):
+    """A tool request emitted only inside an assistant message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantAgentMessage(BaseModel):
+    """One agent turn: either tool calls or the final draft envelope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["assistant"]
+    content: dict[str, Any] | None = None
+    tool_calls: list[AgentToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_one_response_mode(self) -> "AssistantAgentMessage":
+        if bool(self.content) == bool(self.tool_calls):
+            raise ValueError("assistant 消息必须恰好包含 content 或 tool_calls")
+        return self
+
+
+class ToolAgentMessage(BaseModel):
+    """A host-created tool result bound to a prior assistant tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["tool"]
+    tool_call_id: str = Field(min_length=1)
+    content: dict[str, Any]
 
 
 class Claim(BaseModel):
