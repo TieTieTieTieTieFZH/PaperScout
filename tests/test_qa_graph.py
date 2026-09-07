@@ -16,12 +16,14 @@ from paperscout.models import (
     ReadBudget,
     SessionMessage,
     SessionState,
+    UserProfile,
     WorkflowEvent,
 )
 from paperscout.qa import build_qa_graph, parse_qa_model_response, resume_qa, run_qa
 from paperscout.project_memory import persist_project_memory
 from paperscout.read_tool import model_visible_read_result, read_project_file
 from paperscout.session import persist_session
+from paperscout.user_profile import save_user_profile
 
 
 class ScriptedProvider:
@@ -1234,3 +1236,114 @@ def test_project_memory_persistence_failure_resumes_without_repeating_model_call
         / "messages.jsonl"
     ).read_text(encoding="utf-8").splitlines()
     assert len(messages) == 2
+
+
+def test_user_profile_is_loaded_across_projects_and_remains_read_only_for_qa(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    profile = save_user_profile(
+        workspace,
+        UserProfile(
+            research_directions=["检索增强生成", "学术问答"],
+            answer_style_preferences=["先给结论，再给证据"],
+            citation_preferences=["每项论文事实都附 Evidence ID"],
+        ),
+    )
+    profile_path = workspace / "memory" / "profile.json"
+    original_profile = profile_path.read_bytes()
+
+    providers: list[ScriptedProvider] = []
+    for project_id in ("profile-project-a", "profile-project-b"):
+        provider = ScriptedProvider(
+            [
+                _final(
+                    answer="已按用户偏好回答。",
+                    claims=[],
+                    cited_evidence_ids=[],
+                )
+            ]
+        )
+        providers.append(provider)
+        result = run_qa(
+            workspace,
+            "按我的偏好回答。",
+            f"{project_id}-session",
+            project_id=project_id,
+            provider=provider,
+        )
+        assert result["status"] == "completed"
+
+    for provider in providers:
+        context = json.dumps(provider.requests[0], ensure_ascii=False)
+        assert "检索增强生成" in context
+        assert "先给结论，再给证据" in context
+        assert "每项论文事实都附 Evidence ID" in context
+        assert "只读" in context
+    assert profile_path.read_bytes() == original_profile
+    assert UserProfile.model_validate_json(profile_path.read_text(encoding="utf-8")) == profile
+
+
+def test_qa_rejects_profile_patch_and_preserves_user_profile(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    save_user_profile(
+        workspace,
+        UserProfile(answer_style_preferences=["简洁回答"]),
+    )
+    profile_path = workspace / "memory" / "profile.json"
+    original_profile = profile_path.read_bytes()
+    invalid_final = json.loads(
+        _final(
+            answer="不能修改 Profile。",
+            claims=[],
+            cited_evidence_ids=[],
+        )
+    )
+    invalid_final["profile_patch"] = {"answer_style_preferences": ["详细回答"]}
+
+    result = run_qa(
+        workspace,
+        "尝试修改偏好。",
+        "profile-patch-session",
+        provider=ScriptedProvider([json.dumps(invalid_final, ensure_ascii=False)]),
+    )
+
+    assert result["status"] == "failed"
+    assert "valid QA envelope" in result["error"]
+    assert profile_path.read_bytes() == original_profile
+
+
+def test_missing_user_profile_is_empty_non_mutating_and_invalid_profile_fails(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    provider = ScriptedProvider(
+        [
+            _final(
+                answer="当前没有全局偏好。",
+                claims=[],
+                cited_evidence_ids=[],
+            )
+        ]
+    )
+
+    result = run_qa(
+        workspace,
+        "读取默认偏好。",
+        "missing-profile-session",
+        provider=provider,
+    )
+
+    assert result["status"] == "completed"
+    assert '"answer_style_preferences": []' in provider.requests[0][1]["content"]
+    profile_path = workspace / "memory" / "profile.json"
+    assert not profile_path.exists()
+
+    profile_path.write_text('{"unknown": true}\n', encoding="utf-8")
+    with pytest.raises(ValidationError):
+        run_qa(
+            workspace,
+            "损坏的 Profile 必须失败。",
+            "invalid-profile-session",
+            provider=ScriptedProvider([]),
+        )

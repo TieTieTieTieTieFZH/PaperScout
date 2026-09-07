@@ -36,6 +36,7 @@ from .session import (
     invalidate_stale_session_resources,
 )
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
+from .user_profile import load_user_profile
 
 
 QAResponseEnvelope = Annotated[QAToolCallEnvelope | QAFinalEnvelope, Field(discriminator="type")]
@@ -108,6 +109,7 @@ def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
             "role": "system",
             "content": build_qa_context_prompt(
                 project_id=state.project_id,
+                profile=state.profile.model_dump(mode="json"),
                 history_summary=state.history_summary,
                 memory=state.memory.model_dump(mode="json"),
                 invalidated_resources=state.invalidated_resources,
@@ -130,6 +132,7 @@ def _new_state(
     llm_mode: str,
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
+    profile = load_user_profile(store.workspace)
     project = load_project_memory(store.workspace, project_id)
     session, history = load_session(
         store.workspace,
@@ -170,6 +173,7 @@ def _new_state(
         llm_mode=llm_mode,
         status=RunStatus.RUNNING,
         messages=[*recent_history, _message("user", question)],
+        profile=profile,
         history_summary=session.summary,
         memory=memory,
         session_read_resources=session.read_resources,

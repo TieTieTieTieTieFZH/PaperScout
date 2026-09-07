@@ -6,14 +6,19 @@ load_dotenv()
 
 from .workflow import resume_ingest, run_ingest, run_ingest_from_raw
 from .qa import resume_qa, run_qa
+from .models import UserProfile
 from .storage import llmwiki_workspace, reset_test_workspace
+from .user_profile import load_user_profile, save_user_profile
 
 __all__ = [
     "llmwiki_workspace",
+    "load_user_profile",
     "reset_test_workspace",
     "resume_ingest",
     "resume_qa",
     "run_ingest",
     "run_ingest_from_raw",
     "run_qa",
+    "save_user_profile",
+    "UserProfile",
 ]

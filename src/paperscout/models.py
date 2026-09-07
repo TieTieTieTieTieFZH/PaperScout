@@ -264,6 +264,14 @@ class ReadBudget(BaseModel):
         return self
 
 
+class UserProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_directions: list[str] = Field(default_factory=list)
+    answer_style_preferences: list[str] = Field(default_factory=list)
+    citation_preferences: list[str] = Field(default_factory=list)
+
+
 class ProjectMemory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -433,6 +441,7 @@ class QAGraphState(BaseModel):
     current_node: str | None = None
     event_sequence: int = Field(default=0, ge=0)
     messages: list[SessionMessage] = Field(default_factory=list)
+    profile: UserProfile = Field(default_factory=UserProfile)
     history_summary: str = ""
     memory: ProjectMemory = Field(default_factory=ProjectMemory)
     session_read_resources: list[ReadResourceRecord] = Field(default_factory=list)
