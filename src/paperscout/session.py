@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .models import ProjectMemory, ReadResourceRecord, SessionMessage, SessionState
@@ -7,6 +8,9 @@ from .storage import read_json, write_json, write_text_atomic
 
 
 INVALID_SESSION_ID_CHARS = frozenset('<>:"/\\|?*')
+RECENT_SESSION_TURNS = 4
+MAX_SUMMARY_TURNS = 20
+MAX_SUMMARY_MESSAGE_CHARS = 1_000
 
 
 def session_dir(workspace: Path, session_id: str) -> Path:
@@ -57,12 +61,123 @@ def load_session(workspace: Path, session_id: str) -> tuple[SessionState, list[S
     summary = summary_path.read_text(encoding="utf-8")
     if summary != state.summary:
         raise ValueError("Session summary.md does not match state.json")
-    messages = [
+    messages = _read_message_log(messages_path)
+    return state, messages
+
+
+def _read_message_log(path: Path) -> list[SessionMessage]:
+    if not path.exists():
+        return []
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("Session message log must be a normal file")
+    return [
         SessionMessage.model_validate_json(line)
-        for line in messages_path.read_text(encoding="utf-8").splitlines()
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line
     ]
-    return state, messages
+
+
+def session_turns(messages: list[SessionMessage]) -> list[list[SessionMessage]]:
+    turns: list[list[SessionMessage]] = []
+    current: list[SessionMessage] = []
+    for message in messages:
+        if message.role == "user":
+            if current:
+                turns.append(current)
+            current = [message]
+        elif current:
+            current.append(message)
+        else:
+            raise ValueError("Session message log must begin with a user message")
+    if current:
+        turns.append(current)
+    return turns
+
+
+def recent_session_messages(
+    messages: list[SessionMessage],
+    *,
+    keep_turns: int = RECENT_SESSION_TURNS,
+) -> list[SessionMessage]:
+    turns = session_turns(messages)
+    return [message for turn in turns[-keep_turns:] for message in turn]
+
+
+def _compact_text(value: str, limit: int = MAX_SUMMARY_MESSAGE_CHARS) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1] + "…"
+
+
+def _assistant_answer(turn: list[SessionMessage]) -> str:
+    for message in reversed(turn):
+        if message.role != "assistant":
+            continue
+        if isinstance(message.content, dict):
+            if message.content.get("type") == "final":
+                return _compact_text(str(message.content.get("answer", "")))
+            continue
+        return _compact_text(message.content)
+    return ""
+
+
+def build_session_summary(
+    messages: list[SessionMessage],
+    *,
+    memory: ProjectMemory,
+    read_resources: list[ReadResourceRecord],
+    keep_turns: int = RECENT_SESSION_TURNS,
+) -> str:
+    turns = session_turns(messages)
+    compacted = turns[:-keep_turns]
+    if not compacted:
+        return ""
+    omitted = max(0, len(compacted) - MAX_SUMMARY_TURNS)
+    compacted = compacted[-MAX_SUMMARY_TURNS:]
+    aliases = json.dumps(memory.paper_aliases, ensure_ascii=False, sort_keys=True)
+    lines = [
+        "# Session Summary",
+        "",
+        "## Project memory",
+        "",
+        f"- Research goal: {_compact_text(memory.research_goal or 'none')}",
+        f"- Paper aliases: {aliases}",
+        f"- Confirmed decisions: {json.dumps(memory.confirmed_decisions, ensure_ascii=False)}",
+        f"- Unresolved questions: {json.dumps(memory.unresolved_questions, ensure_ascii=False)}",
+        f"- Research hypotheses: {json.dumps(memory.research_hypotheses, ensure_ascii=False)}",
+        f"- Evidence IDs: {json.dumps(memory.evidence_ids, ensure_ascii=False)}",
+        "",
+        "## Read resources",
+        "",
+    ]
+    if read_resources:
+        for record in read_resources:
+            evidence = ", ".join(record.evidence_ids) or "none"
+            lines.append(
+                f"- `{record.path}` offset={record.offset_chars} chars={record.returned_chars} "
+                f"sha256={record.sha256} evidence={evidence}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Compacted turns", ""])
+    if omitted:
+        lines.append(f"- {omitted} older compacted turns remain only in messages.jsonl.")
+        lines.append("")
+    first_turn_number = omitted + 1
+    for index, turn in enumerate(compacted, start=first_turn_number):
+        user = _compact_text(str(turn[0].content))
+        answer = _assistant_answer(turn)
+        lines.extend(
+            [
+                f"### Turn {index}",
+                "",
+                f"- User: {user}",
+                f"- Assistant: {answer or 'no final answer'}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def merge_project_memory(current: ProjectMemory, patch: ProjectMemory) -> ProjectMemory:
@@ -107,13 +222,31 @@ def persist_session(
     workspace: Path,
     *,
     session_id: str,
-    messages: list[SessionMessage],
-    summary: str,
+    new_messages: list[SessionMessage],
+    expected_message_count: int,
     memory: ProjectMemory,
     read_resources: list[ReadResourceRecord],
 ) -> SessionState:
     path = session_dir(workspace, session_id)
     path.mkdir(parents=True, exist_ok=True)
+    messages_path = path / "messages.jsonl"
+    persisted_messages = _read_message_log(messages_path)
+    new_message_ids = [message.message_id for message in new_messages]
+    if len(persisted_messages) == expected_message_count:
+        messages = [*persisted_messages, *new_messages]
+    elif (
+        len(persisted_messages) == expected_message_count + len(new_messages)
+        and [message.message_id for message in persisted_messages[-len(new_messages) :]]
+        == new_message_ids
+    ):
+        messages = persisted_messages
+    else:
+        raise RuntimeError("Session message log changed since this QA run started")
+    summary = build_session_summary(
+        messages,
+        memory=memory,
+        read_resources=read_resources,
+    )
     state = SessionState(
         session_id=session_id,
         summary=summary,
@@ -121,7 +254,7 @@ def persist_session(
         read_resources=read_resources,
     )
     message_log = "".join(f"{message.model_dump_json()}\n" for message in messages)
-    write_text_atomic(path / "messages.jsonl", message_log)
+    write_text_atomic(messages_path, message_log)
     write_text_atomic(path / "summary.md", summary)
     write_json(path / "state.json", state.model_dump(mode="json", exclude={"messages"}))
     return state

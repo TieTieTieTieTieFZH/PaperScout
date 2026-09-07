@@ -426,6 +426,7 @@ class QAGraphState(BaseModel):
     history_summary: str = ""
     memory: ProjectMemory = Field(default_factory=ProjectMemory)
     session_read_resources: list[ReadResourceRecord] = Field(default_factory=list)
+    session_message_count: int = Field(default=0, ge=0)
     read_resources: list[ReadResourceRecord] = Field(default_factory=list)
     read_budget: ReadBudget = Field(default_factory=ReadBudget)
     turn_start_message_index: int = Field(default=0, ge=0)

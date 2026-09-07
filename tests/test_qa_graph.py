@@ -19,6 +19,7 @@ from paperscout.models import (
 )
 from paperscout.qa import build_qa_graph, parse_qa_model_response, resume_qa, run_qa
 from paperscout.read_tool import model_visible_read_result, read_project_file
+from paperscout.session import persist_session
 
 
 class ScriptedProvider:
@@ -721,11 +722,16 @@ def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
             )
         ]
     )
+    persist_then_fail_calls = 0
+
+    def persist_then_fail(*args: Any, **kwargs: Any) -> Any:
+        nonlocal persist_then_fail_calls
+        persist_then_fail_calls += 1
+        persist_session(*args, **kwargs)
+        raise OSError("temporary session failure")
+
     with monkeypatch.context() as patcher:
-        patcher.setattr(
-            "paperscout.qa.persist_session",
-            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("temporary session failure")),
-        )
+        patcher.setattr("paperscout.qa.persist_session", persist_then_fail)
         interrupted = run_qa(
             workspace,
             "问题",
@@ -737,6 +743,7 @@ def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
     assert interrupted["next_nodes"] == ["complete_qa"]
     assert "temporary session failure" in interrupted["error"]
     assert len(provider.requests) == 1
+    assert persist_then_fail_calls == 1
 
     no_call_provider = ScriptedProvider([])
     result = resume_qa(
@@ -751,3 +758,117 @@ def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
     assert (session_dir / "state.json").is_file()
     assert (session_dir / "messages.jsonl").is_file()
     assert (session_dir / "summary.md").is_file()
+    assert len((session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_session_context_keeps_four_turns_and_compacts_old_tool_text(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    old_tool_text = "FIRST_TOOL_BODY_SHOULD_NOT_REENTER_CONTEXT"
+    paper_path = workspace / "wiki" / "papers" / "paper-1.md"
+    paper_path.write_text(
+        paper_path.read_text(encoding="utf-8") + f"\n{old_tool_text}\n",
+        encoding="utf-8",
+    )
+    first = run_qa(
+        workspace,
+        "问题一",
+        "session-compact",
+        provider=ScriptedProvider(
+            [
+                _tool_call("old-tool", "wiki/papers/paper-1.md"),
+                _final(
+                    answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "论文记录了方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                    memory_patch={
+                        "research_goal": "比较论文方法",
+                        "paper_aliases": {"目标论文": "paper-1"},
+                        "unresolved_questions": ["方法差异是什么？"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    },
+                ),
+            ]
+        ),
+    )
+    assert first["status"] == "completed"
+    for turn in range(2, 6):
+        result = run_qa(
+            workspace,
+            f"问题{turn}",
+            "session-compact",
+            provider=ScriptedProvider(
+                [
+                    _final(
+                        answer="当前资料不足。",
+                        claims=[],
+                        cited_evidence_ids=[],
+                        status="insufficient_evidence",
+                    )
+                ]
+            ),
+        )
+        assert result["status"] == "completed"
+
+    sixth_provider = ScriptedProvider(
+        [
+            _final(
+                answer="当前资料不足。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+    sixth = run_qa(
+        workspace,
+        "问题6",
+        "session-compact",
+        provider=sixth_provider,
+    )
+
+    assert sixth["status"] == "completed"
+    request = sixth_provider.requests[0]
+    retained_user_messages = [
+        message["content"]
+        for message in request[2:]
+        if message["role"] == "user"
+    ]
+    assert retained_user_messages == ["问题2", "问题3", "问题4", "问题5", "问题6"]
+    assert old_tool_text not in json.dumps(request, ensure_ascii=False)
+    history_summary = request[1]["content"]
+    assert "问题一" in history_summary
+    assert "比较论文方法" in history_summary
+    assert "目标论文" in history_summary
+    assert "方法差异是什么？" in history_summary
+    assert "wiki/papers/paper-1.md" in history_summary
+    assert "paper-1:s0001" in history_summary
+    assert first["read_resources"][0]["sha256"] in history_summary
+
+    session_dir = workspace / "memory" / "sessions" / "session-compact"
+    message_log = (session_dir / "messages.jsonl").read_text(encoding="utf-8")
+    summary = (session_dir / "summary.md").read_text(encoding="utf-8")
+    state = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert len(message_log.splitlines()) == 14
+    assert old_tool_text in message_log
+    assert old_tool_text not in summary
+    assert "问题一" in summary
+    assert "问题2" in summary
+    assert state.summary == summary
+    events = [
+        WorkflowEvent.model_validate_json(line)
+        for line in (workspace / "runs" / sixth["run_id"] / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event.event_type for event in events].count(EventKind.CONTEXT_COMPACTED) == 1

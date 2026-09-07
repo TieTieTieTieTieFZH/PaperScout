@@ -27,7 +27,13 @@ from .models import (
 )
 from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
 from .read_tool import model_visible_read_result, read_project_file
-from .session import load_session, merge_project_memory, merge_read_resources, persist_session
+from .session import (
+    load_session,
+    merge_project_memory,
+    merge_read_resources,
+    persist_session,
+    recent_session_messages,
+)
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
 
 
@@ -121,6 +127,7 @@ def _new_state(
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
     session, history = load_session(store.workspace, session_id)
+    recent_history = recent_session_messages(history)
     run_id = uuid.uuid4().hex
     state = QAGraphState(
         run_id=run_id,
@@ -130,12 +137,13 @@ def _new_state(
         question=question,
         llm_mode=llm_mode,
         status=RunStatus.RUNNING,
-        messages=[*history, _message("user", question)],
+        messages=[*recent_history, _message("user", question)],
         history_summary=session.summary,
         memory=session.memory,
         session_read_resources=session.read_resources,
+        session_message_count=len(history),
         read_budget=read_budget or ReadBudget(),
-        turn_start_message_index=len(history),
+        turn_start_message_index=len(recent_history),
     )
     _event(store, state, EventKind.RUN_STARTED, "qa", "QA run started", agent=AgentKind.QA)
     return state
@@ -347,13 +355,23 @@ def build_qa_graph(
             session = persist_session(
                 store.workspace,
                 session_id=state.session_id,
-                messages=state.messages,
-                summary=state.history_summary,
+                new_messages=state.messages[state.turn_start_message_index :],
+                expected_message_count=state.session_message_count,
                 memory=memory,
                 read_resources=session_resources,
             )
         except Exception as exc:
             raise RetryableNodeError(f"QA session persistence failed: {exc}") from exc
+        if session.summary != state.history_summary:
+            _event(
+                store,
+                state,
+                EventKind.CONTEXT_COMPACTED,
+                state.current_node,
+                "Compacted older QA turns into the session summary",
+                {"retained_turns": 4},
+                agent=AgentKind.QA,
+            )
         result = {
             "status": "completed",
             "run_id": state.run_id,
@@ -373,6 +391,7 @@ def build_qa_graph(
             "current_node": state.current_node,
             "event_sequence": state.event_sequence,
             "status": RunStatus.COMPLETED.value,
+            "history_summary": session.summary,
             "memory": session.memory.model_dump(mode="json"),
             "session_read_resources": [
                 record.model_dump(mode="json") for record in session.read_resources

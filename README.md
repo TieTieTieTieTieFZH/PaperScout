@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件和同一 Session 多轮继续；最近四轮压缩和 Answer Review 仍在开发。
+- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件、同一 Session 多轮继续和最近四轮上下文压缩；Answer Review 仍在开发。
 - QA 只使用宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；模型只看到精简 JSON 外壳与自然语言正文，哈希和完整预算信息保留在宿主审计中。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
@@ -106,7 +106,7 @@ result = resume_qa(
 )
 ```
 
-QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、本轮重复调用 ID 或未读 Evidence 引用会失败关闭。完成的轮次会写入 `memory/sessions/{session_id}/messages.jsonl`、`state.json` 和 `summary.md`；下一次使用同一 `session_id` 时会继续既有历史、项目记忆和已读资源元数据。工具正文只保存在消息审计中，不进入 `state.json` 或 `summary.md`。当前尚未执行最近四轮裁剪或结构化摘要压缩，因此长会话仍可能增长。`mock` 只验证确定性控制流；真实问答质量需要使用 `real` 单独人工评测。
+QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、本轮重复调用 ID 或未读 Evidence 引用会失败关闭。完成的轮次会写入 `memory/sessions/{session_id}/messages.jsonl`、`state.json` 和 `summary.md`；下一次使用同一 `session_id` 时会继续既有项目记忆、结构化摘要、最近四个完整历史轮次和已读资源元数据。更早轮次的工具正文只保存在完整消息审计中，不进入模型上下文；摘要保留路径、SHA256 和 Evidence ID。当前固定按四轮压缩，尚未接入真实模型 token 窗口的动态阈值、资源哈希失效重读或项目级长期记忆。`mock` 只验证确定性控制流；真实问答质量需要使用 `real` 单独人工评测。
 
 ### 使用本地 MinerU 结果
 
