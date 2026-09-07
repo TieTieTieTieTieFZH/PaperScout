@@ -55,7 +55,7 @@
 | 2026-09-07 | `649d152` | 新增当前架构手册、进度台账并修正文档中的过期能力声明。 | 22 个离线测试、依赖锁检查、补丁格式检查和代码文件覆盖检查均通过。 |
 | 2026-09-07 | `2fdb03c` | 新增根目录 `AGENTS.md`，固化文档阅读顺序、开发边界、提问条件和验证/推送规则。 | 22 个离线测试、依赖锁、文档引用和补丁格式检查通过。 |
 | 2026-09-07 | `606e1dd` | 将 raw→Wiki 主路径切换为真实 LangGraph `StateGraph`，接入 SQLite Checkpointer、显式失败分支、结构化覆盖报告和发布前二次完整性门。 | 26 个离线测试、依赖锁、补丁格式、图接线和过期架构声明检查通过。 |
-| 2026-09-07 | 本次 Wiki Review 提交 | 接入独立 Wiki Review Chat Client、严格 verdict parser、只提交实际引用 Evidence、Review 审计文件和 `REVISE/REJECT` 重生成循环。 | 严格解析、APPROVE、REVISE、连续 REJECT、非法输出、Evidence 范围、审计文件和失败不发布测试通过；提交前复跑完整基线。 |
+| 2026-09-07 | `27cf929` | 接入独立 Wiki Review Chat Client、严格 verdict parser、只提交实际引用 Evidence、Review 审计文件和 `REVISE/REJECT` 重生成循环。 | 37 个离线测试、依赖锁、逐文件架构登记、过期声明和补丁格式检查通过。 |
 
 ## 5. 项目经历表述验收
 
