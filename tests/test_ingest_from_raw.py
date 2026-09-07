@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from paperscout.models import EventKind, WorkflowEvent
-from paperscout.workflow import run_ingest_from_raw
+from paperscout.graph_runtime import GraphRuntime, graph_config
+from paperscout.models import EventKind, ReviewDecision, ReviewVerdict, WorkflowEvent
+from paperscout.workflow import build_ingest_graph, run_ingest_from_raw
 
 
 PAPER_ID = "2409.18839v1"
@@ -165,4 +166,98 @@ def test_raw_change_after_generation_prevents_publish(tmp_path: Path, monkeypatc
     provider = SequenceProvider([_summary()], mutate=mutate)
     monkeypatch.setattr("paperscout.workflow._provider", lambda mode: provider)
     assert run_ingest_from_raw(tmp_path, PAPER_ID)["status"] == "failed"
+    assert not (tmp_path / "wiki").exists()
+
+
+def test_ingest_runs_as_checkpointed_state_graph(tmp_path: Path) -> None:
+    _raw_tree(tmp_path)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")
+
+    assert result["status"] == "published"
+    assert (tmp_path / "runtime" / "checkpoints.sqlite").is_file()
+    config = graph_config(f"ingest:{result['run_id']}")
+    with GraphRuntime.open(tmp_path) as runtime:
+        graph = build_ingest_graph(runtime, provider=SequenceProvider([_summary()]), context_window=128_000)
+        snapshot = graph.get_state(config)
+        nodes = set(graph.get_graph().nodes)
+    assert snapshot.values["status"] == "completed"
+    assert snapshot.values["published"] is True
+    assert snapshot.values["current_node"] == "publish_wiki"
+    assert {
+        "prepare_ingest_context",
+        "ingest_agent",
+        "validate_wiki",
+        "repair_ingest",
+        "verify_raw",
+        "render_wiki",
+        "wiki_rules",
+        "verify_publish",
+        "publish_wiki",
+        "fail_run",
+    } <= nodes
+
+
+def test_coverage_failure_is_checkpointed_and_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    provider = SequenceProvider([_summary()])
+    provider.settings = SimpleNamespace(ingest_context_window=10)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: provider)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert result["status"] == "failed"
+    assert result["coverage"]["truncated"] is True
+    assert result["coverage"]["eligible_section_count"] == 4
+    assert result["coverage"]["last_included_content_index"] is None
+    assert provider.calls == 0
+    assert not (tmp_path / "wiki").exists()
+    with GraphRuntime.open(tmp_path) as runtime:
+        graph = build_ingest_graph(runtime, provider=provider, context_window=10)
+        snapshot = graph.get_state(graph_config(f"ingest:{result['run_id']}"))
+    assert snapshot.values["status"] == "failed"
+    assert snapshot.values["published"] is False
+    assert snapshot.values["current_node"] == "fail_run"
+    assert snapshot.values["input_coverage"]["truncated"] is True
+    assert "refusing to publish an incomplete" in snapshot.values["last_error"]
+
+
+def test_rule_review_rejection_is_checkpointed_and_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    rejected = ReviewDecision(verdict=ReviewVerdict.REJECT, feedback=["coverage is insufficient"])
+    monkeypatch.setattr("paperscout.workflow.check_wiki_rules", lambda staging: rejected)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")
+
+    assert result["status"] == "failed"
+    assert result["review"] == rejected.model_dump(mode="json")
+    assert not (tmp_path / "wiki").exists()
+    with GraphRuntime.open(tmp_path) as runtime:
+        graph = build_ingest_graph(runtime, provider=SequenceProvider([_summary()]), context_window=128_000)
+        snapshot = graph.get_state(graph_config(f"ingest:{result['run_id']}"))
+    assert snapshot.values["status"] == "failed"
+    assert snapshot.values["current_node"] == "fail_run"
+    assert snapshot.values["review"]["verdict"] == "REJECT"
+
+
+def test_raw_change_during_review_prevents_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _raw_tree(tmp_path)
+
+    def approve_after_mutation(staging: Path) -> ReviewDecision:
+        path = raw / "mineru" / "content_list.json"
+        path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        return ReviewDecision(verdict=ReviewVerdict.APPROVE)
+
+    monkeypatch.setattr("paperscout.workflow.check_wiki_rules", approve_after_mutation)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")
+
+    assert result["status"] == "failed"
+    assert "Raw input changed during ingest" in result["error"]
     assert not (tmp_path / "wiki").exists()

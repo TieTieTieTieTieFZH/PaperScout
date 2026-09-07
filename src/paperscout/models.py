@@ -256,6 +256,10 @@ class IngestGraphState(BaseModel):
     status: RunStatus = RunStatus.PENDING
     current_node: str | None = None
     event_sequence: int = Field(default=0, ge=0)
+    paper: dict[str, Any] | None = None
+    evidence: list[SectionEvidence] = Field(default_factory=list)
+    citable_document: str | None = None
+    raw_hashes: dict[str, str] = Field(default_factory=dict)
     input_coverage: EvidenceExtractionReport | None = None
     input_evidence_ids: list[str] = Field(default_factory=list)
     candidate_markdown: str | None = None
@@ -267,6 +271,7 @@ class IngestGraphState(BaseModel):
     staging_path: str | None = None
     published: bool = False
     last_error: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class AgentToolCall(BaseModel):

@@ -188,10 +188,10 @@ Ingest 的职责是：
 1. 程序读取完整 `content_list.json`；
 2. 按 `text_level: 2` 整理为 section evidence；
 3. 一次性将可用 evidence 提供给 Ingest；
-4. 超出上下文预算时，在完整 block 或完整 section evidence 边界截断；
-5. 记录总 evidence 数、实际输入数量、最后输入位置和是否发生截断。
+4. 在完整 section evidence 边界计算上下文覆盖范围；
+5. 如果完整 evidence 无法全部装入预算，记录总 evidence 数、实际可输入数量、最后可输入位置和截断状态，然后失败关闭。
 
-发生截断后，Ingest 只能根据实际提供的内容生成 Wiki，不能声称已经阅读全文，也不能自行补写未读取部分的结论。
+发生任何截断时不得调用 Ingest、不得生成或发布不完整 Wiki；运行结果必须明确报告输入覆盖不足。第一版不在部分 Evidence 上生成降级 Wiki。
 
 ## 6. Review 与发布
 

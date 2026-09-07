@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前包含可运行的 Wiki Ingest 流程；Retrieval QA、Session、语义 Review 和实际 LangGraph 图仍在开发。
+- 当前 Wiki Ingest 已由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；Retrieval QA、Session、语义 Review 和中断恢复仍在开发。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
@@ -69,7 +69,7 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 - **raw → Wiki**：调用 `run_ingest_from_raw()`；它只读取已有的 `raw/papers/{paper_id}/metadata.json` 与 `mineru/content_list.json`，不会调用 MinerU、复制 PDF、修改或删除 raw。
 - **PDF → raw → Wiki**：`run_ingest()` 完成导入后复用与 `run_ingest_from_raw()` 相同的校验、渲染和发布流程。
 
-宿主只使用当前论文的 `mineru/content_list.json`，按 `type: text`、`text_level: 2` 聚合 section evidence。Evidence ID 使用二级标题在原始数组中的下标，例如 `<paper_id>:s0042`。Ingest 是无工具 Chat Client；输入必须一次性完整装入预算，若简单前缀会发生截断则失败关闭，不生成不完整 Wiki。
+宿主只使用当前论文的 `mineru/content_list.json`，按 `type: text`、`text_level: 2` 聚合 section evidence。Evidence ID 使用二级标题在原始数组中的下标，例如 `<paper_id>:s0042`。Ingest 是无工具 Chat Client；输入必须一次性完整装入预算，若简单前缀会发生截断则失败关闭，在失败结果和 Checkpoint 中记录结构化覆盖信息，不生成不完整 Wiki。
 
 ## Python API
 

@@ -1,6 +1,6 @@
 # PaperScout 当前架构手册
 
-> 基线：本手册描述 `main` 分支在 `0aaf0f6` 之后、LangGraph 重构进行中的真实实现。它不把 TODO 中的目标能力写成已完成功能。进度与验证状态见 [重构进度台账](./refactor-progress.md)。
+> 基线：本手册描述 LangGraph 重构进行中的当前 `main` 实现。它不把 TODO 中的目标能力写成已完成功能。进度与验证状态见 [重构进度台账](./refactor-progress.md)。
 
 ## 1. 系统定位与边界
 
@@ -13,7 +13,7 @@ PaperScout 是一个本地、单用户、单进程、文件系统优先的论文
 - `runs/` 是单次运行的审计层，保存事件、结果、模型原始输出和失败信息。
 - `runtime/checkpoints.sqlite` 是 LangGraph 执行位置的持久化层；它与用户可读 Session、审计事件是不同契约。
 - 当前只有 Ingest 具备可运行实现；QA Graph、Session 持久化、上下文压缩和语义 Review 尚未完成。
-- 当前 Ingest 编排仍是 Python 顺序流程，尚未切换为真正的 LangGraph `StateGraph`。`GraphRuntime` 只是已验证的 Checkpointer 骨架。
+- 当前 Ingest 已由真正的 LangGraph `StateGraph` 编排，并通过 `GraphRuntime` 将各节点状态写入 SQLite Checkpointer；尚未实现语义 Wiki Review 和中断后续跑。
 
 ## 2. 当前组件与数据流
 
@@ -44,7 +44,7 @@ PDF + MinerU API ─┘                         │
                         原子发布到 wiki/       不发布并记录失败
 ```
 
-`workflow.py` 目前串联上述组件。它会在运行中追加严格的 `WorkflowEvent`，但还没有把各步骤建成 LangGraph 节点和条件边。
+`workflow.py` 将上述组件注册为显式 LangGraph 节点和条件边。规则失败可进入一次修复，任何节点错误或审核拒绝进入统一失败终态，只有审核通过且发布前再次核对 raw、候选哈希和 staging 后才能进入发布节点。运行过程同时追加严格的 `WorkflowEvent`。
 
 ## 3. 工作区数据布局
 
@@ -81,7 +81,7 @@ workspace/
 - Evidence ID 为 `{paper_id}:s{二级标题在 content_list 中的原始下标，四位补零}`。跳过噪声块不会重编号。
 - `papers/{paper_id}.md` 固定为“研究问题、核心思路、方法、实验概况、结论与局限”五栏。
 - `events.jsonl` 是审计事件，不是恢复 Checkpoint；当前不再生成自定义 `runs/{run_id}/state.json`。
-- `checkpoints.sqlite` 只有使用 `GraphRuntime` 编译并运行图时才建立；当前 Ingest 尚未接入它。
+- 每次 Ingest 都通过 `GraphRuntime` 运行，并将 JSON 原生 Graph State 保存到 `checkpoints.sqlite`；当前可在 runtime 重建后读取终态，但尚未提供中断后续跑 API。
 
 ## 4. 运行时契约
 
@@ -101,7 +101,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 ### 4.4 Graph State 与 Checkpoint
 
-`IngestGraphState` 和 `QAGraphState` 是严格 Pydantic 状态契约。`GraphRuntime` 使用 SQLite Saver，并要求非空 `thread_id`。持久化跨运行时重建已经有契约测试，但现有 Ingest 流程没有使用 `StateGraph`，QA Graph 也不存在。
+`IngestGraphState` 和 `QAGraphState` 是严格 Pydantic 状态契约。`GraphRuntime` 使用 SQLite Saver，并要求非空 `thread_id`。Ingest 使用 `IngestGraphState` 定义节点输入，并以 JSON 原生值写入 Checkpoint；成功、覆盖不足和规则审核拒绝的终态均已验证可在 runtime 重建后读取。QA Graph 和通用中断恢复仍不存在。
 
 ### 4.5 Session 与读取工具
 
@@ -119,10 +119,12 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 4. 记录 raw 文件哈希，读取 `metadata.json` 和 `content_list.json`。
 5. 按二级标题构造 section evidence，并生成供模型一次性读取的 citable Markdown。
 6. 采用简单前缀预算；若完整输入放不下，直接失败，不调用模型、不发布 Wiki。
-7. Ingest Chat Client 生成固定五栏 Markdown；本地解析失败时，携带错误反馈修复一次。
-8. 再次校验 raw 哈希；若模型调用期间 raw 变化，直接失败。
-9. 在 `runs/{run_id}/staging/wiki` 渲染论文页、Evidence、索引和健康报告。
-10. 确定性规则审核通过后，原子替换正式 `wiki/`；任何异常都保留运行证据并不发布该论文 Wiki。
+7. `ingest_agent` 生成固定五栏 Markdown，`validate_wiki` 解析；失败且未达到最大次数时经条件边进入 `repair_ingest`，只修复一次。
+8. `verify_raw` 再次校验 raw 哈希；若模型调用期间 raw 变化，进入 `fail_run`。
+9. `render_wiki` 在 `runs/{run_id}/staging/wiki` 渲染论文页、Evidence、索引和健康报告。
+10. `wiki_rules` 执行确定性审核；拒绝时进入 `fail_run`。
+11. `verify_publish` 在发布前再次检查 raw 哈希、候选哈希和 staging；任一变化都不发布。
+12. `publish_wiki` 原子替换正式 `wiki/` 并保存成功终态；其他路径统一保存失败终态。
 
 ## 6. 每个代码与工程文件的作用
 
@@ -140,8 +142,8 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `src/paperscout/wiki.py` | 渲染模型输入、解析/校验五栏候选、生成论文 Wiki、读写 section evidence、更新规范索引。 | 不含旧 chunks/claims/concepts 或迁移兼容逻辑。 |
 | `src/paperscout/health.py` | 对 staging Wiki 执行确定性结构/引用规则并生成健康报告。 | 不是语义 Review Agent。 |
 | `src/paperscout/storage.py` | 文件系统路径、JSON/哈希、严格事件追加、staging 准备、带回滚的原子发布、结果写入和安全复制。 | Checkpoint 不存于此；旧自定义运行状态文件已删除。 |
-| `src/paperscout/graph_runtime.py` | 创建 SQLite LangGraph Checkpointer、生成 `thread_id` 配置并编译任意 `StateGraph`。 | 骨架和持久化已验证，尚未编译实际 Ingest/QA 图。 |
-| `src/paperscout/workflow.py` | 当前 Ingest 应用服务：上下文、模型生成/修复、raw 不变性校验、staging、规则审核、发布和失败记录。 | 仍是手写顺序编排，不是 LangGraph 图。 |
+| `src/paperscout/graph_runtime.py` | 创建 SQLite LangGraph Checkpointer、生成 `thread_id` 配置并编译任意 `StateGraph`。 | 已编译实际 Ingest 图；QA 图和中断恢复尚未接入。 |
+| `src/paperscout/workflow.py` | 定义并运行 Ingest `StateGraph`：上下文、模型生成/修复、两次 raw 不变性校验、staging、规则审核、发布和统一失败终态。 | 已是实际 LangGraph 图；语义 Wiki Review 节点尚未实现。 |
 
 ### 6.2 自动化测试与人工验证脚本
 
@@ -149,7 +151,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | --- | --- | --- |
 | `tests/test_evidence_contract.py` | 验证稳定 Evidence ID、章节归属、解析质量失败和严格参数契约。 | 是。 |
 | `tests/test_p0a_contracts.py` | 验证 Wiki/Session/Graph/Event 契约，以及 SQLite Checkpoint 跨运行时恢复。 | 是。 |
-| `tests/test_ingest_from_raw.py` | 验证 raw→Wiki 闭环、固定五栏、Evidence 产物、事件、一次修复及各种失败不发布。 | 是。 |
+| `tests/test_ingest_from_raw.py` | 验证 raw→Wiki 闭环、固定五栏、Evidence 产物、事件、一次修复、真实图节点、SQLite 终态、结构化覆盖报告及各种失败不发布。 | 是。 |
 | `tests/fixtures/mineru_micro/content_list.json` | 最小确定性 MinerU fixture，覆盖二级章节和 Evidence 构造。 | 被自动测试读取。 |
 | `tests/manual_raw_to_wiki.py` | 使用本机已有 raw 手动运行真实或 Mock Ingest。 | 否，需人工调用。 |
 | `tests/manual_mineru_raw.py` | 手动调用 MinerU API，把本地 PDF 解析并导入 raw。 | 否；含本机示例路径，需按环境修改。 |
@@ -182,8 +184,8 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 当前最大架构缺口不是数据模型，而是“模型已经定义、执行图尚未接线”：
 
-1. 把 `workflow.py` 拆为实际 Ingest `StateGraph` 节点，并用 `GraphRuntime` 编译；
-2. 增加独立 Wiki Review Chat Client、严格 verdict 解析和条件边；
+1. 增加独立 Wiki Review Chat Client、严格 verdict 解析、修订反馈和条件循环；
+2. 为 Ingest 增加明确的中断后续跑入口和幂等副作用策略；
 3. 实现受控的 `read_project_file` 与 QA Agent Loop；
 4. 接入 Session 文件、上下文压缩、恢复和长期项目记忆；
 5. 增加 Answer Review；
@@ -199,4 +201,4 @@ uv --no-cache lock --check
 git diff --check
 ```
 
-离线 pytest 证明当前自动测试覆盖的行为没有回归，但不能证明尚未实现的 QA、Session、语义 Review 或真实 LangGraph Ingest 已经完成。真实 MinerU/LLM 只通过对应人工脚本单独验证，不能混入离线基线结论。
+离线 pytest 证明当前自动测试覆盖的行为没有回归，但不能证明尚未实现的 QA、Session、语义 Review 或中断恢复已经完成。真实 MinerU/LLM 只通过对应人工脚本单独验证，不能混入离线基线结论。

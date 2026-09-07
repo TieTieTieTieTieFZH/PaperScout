@@ -74,4 +74,4 @@ QA 不能引用未由命中摘要加载的 evidence。证据不足时，必须�
 
 每个运行保存状态、事件、模型原始输出、校验错误和最终结果。发布以完整 staging Wiki 的原子替换完成，避免产生半更新的 Wiki。
 
-LangGraph 运行时使用 `runtime/checkpoints.sqlite` 保存 thread checkpoint。Checkpoint、用户可读 Session 和审计事件是三个独立契约；当前阶段已建立 SQLite 生命周期与 `thread_id` 配置骨架，后续 Graph 节点逐步接入。
+LangGraph 运行时使用 `runtime/checkpoints.sqlite` 保存 thread checkpoint。当前 Ingest 已拆为上下文、生成、校验、修复、raw 复核、staging、规则审核、发布前复核、发布和失败终态节点，并通过显式条件边运行。Checkpoint、用户可读 Session 和审计事件仍是三个独立契约；当前只验证了 Ingest 节点终态可在 runtime 重建后读取，中断后续跑属于后续恢复阶段。

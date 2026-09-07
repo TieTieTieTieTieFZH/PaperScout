@@ -18,13 +18,13 @@
 
 | 项目 | 当前结果 | 实现是否已验证 | 验证方式 |
 | --- | --- | --- | --- |
-| 离线测试集 | 22 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q` |
+| 离线测试集 | 26 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q` |
 | 依赖锁一致性 | 通过 | 本地自动验证 | `uv --no-cache lock --check`（绕开本机全局 uv cache 路径冲突，不改变校验语义） |
 | 补丁空白/冲突标记 | 通过 | 本地自动验证 | `git diff --check` |
 | Windows GitHub Actions | 本次 main 推送后触发 | 未验证 | `.github/workflows/ci.yml`：`uv sync --frozen --group dev`，随后 `uv run pytest -q` |
 | 真实 MinerU/真实 LLM | 未纳入本轮 | 未验证 | `tests/manual_mineru_raw.py`、`tests/manual_raw_to_wiki.py`、`tests/evaluate_ingest_agent.py` |
 
-这里的 22 个测试只证明表中已覆盖的当前行为，不证明尚未接线的 LangGraph Ingest、QA、Session 或语义 Review。
+这里的 26 个测试只证明表中已覆盖的当前行为，不证明尚未实现的 QA、Session、语义 Review 或中断恢复。
 
 ## 3. 阶段进度
 
@@ -35,9 +35,9 @@
 | P0-A Wiki 契约 | 已完成 | 固定五栏与顺序、每栏 1–3 个当前输入 Evidence、规范渲染与索引。 | 本地自动验证 | `tests/test_p0a_contracts.py`、`tests/test_ingest_from_raw.py` | 无。 |
 | P0-A Review 契约 | 仅契约 | `ReviewVerdict`/`ReviewDecision` 严格模型。 | 本地自动验证 | 非法 verdict 拒绝测试 | 尚无语义 Review Client 和工作流节点。 |
 | P0-A Session/Graph State/Tool/Event 契约 | 仅契约 | 严格 Session、预算、Tool Call、Graph State、WorkflowEvent 模型。 | 本地自动验证 | `tests/test_p0a_contracts.py`、`tests/test_evidence_contract.py` | 执行层分别属于 P0-C、P0-D、P1。 |
-| P0-B Ingest 核心 | 部分实现 | section evidence 输入、无工具 Chat Client、一次修复、raw 哈希保护、staging、确定性规则审核、原子发布。 | 本地自动验证 | `tests/test_ingest_from_raw.py` | 仍是手写顺序流程；缺少真实 `StateGraph`、语义 Wiki Review、verdict 条件边和图级恢复。 |
+| P0-B Ingest 核心 | 部分实现 | 真实 `StateGraph` 节点与条件边、section evidence 输入、无工具 Chat Client、一次修复、两次 raw 哈希保护、候选哈希复核、staging、确定性规则审核、原子发布和统一失败终态。 | 本地自动验证 | `tests/test_ingest_from_raw.py`：成功/覆盖失败/规则拒绝终态、节点集合、修复分支和发布门 | 缺少语义 Wiki Review Chat Client、`REVISE/REJECT` 语义循环和中断后续跑。 |
 | P0-C QA Graph 与只读工具 | 未开始 | 仅保留状态、参数和预算契约。 | 未验证 | 无可运行 QA 功能 | 实现工具权限/预算、Agent Loop、渐进读取、多论文引用校验。 |
-| P0-D1 SQLite Checkpointer 骨架 | 部分实现 | `GraphRuntime`、SQLite Saver、`thread_id` 配置、跨 runtime reconstruction 持久化。 | 本地自动验证 | `test_sqlite_checkpointer_survives_runtime_reconstruction` | 接入真实 Ingest/QA 图并验证中断恢复。 |
+| P0-D1 SQLite Checkpointer | 部分实现 | `GraphRuntime`、SQLite Saver、`thread_id` 配置；实际 Ingest 各节点使用 Checkpointer，成功和失败终态可跨 runtime reconstruction 读取。 | 本地自动验证 | `test_sqlite_checkpointer_survives_runtime_reconstruction`、`test_ingest_runs_as_checkpointed_state_graph`、失败终态测试 | QA 尚未接入；未实现并验证中断后续跑和副作用幂等。 |
 | P0-D2 Session、压缩与记忆 | 仅契约 | Session/消息/资源记录/预算/项目记忆模型。 | 本地自动验证（仅模型） | 严格模型测试 | 文件持久化、最近四轮、结构化摘要、旧工具文本移除、继续执行与恢复均未实现。 |
 | P0-E Answer Review | 未开始 | 只有通用 Review 契约。 | 未验证 | 无 | 答案规则、语义 Review、补读/修订/拒绝条件边。 |
 | P1 事件与可观测性 | 部分实现 | Ingest 严格 JSONL 事件及运行关联字段。 | 本地自动验证 | Ingest 事件序列测试 | QA/Tool/Review/Compaction 全事件、流式消费和回放未实现。 |
@@ -53,14 +53,15 @@
 | 2026-09-06 | `4b6ced0` | Ingest 切换到新的 Section Evidence 输入和失败关闭策略。 | 本地 Ingest 流程测试通过。 |
 | 2026-09-07 | `0aaf0f6` | 删除重构前 QA、Evidence、迁移和自定义 checkpoint 兼容路径。 | 22 个离线测试通过；旧符号静态审计无残留。 |
 | 2026-09-07 | `649d152` | 新增当前架构手册、进度台账并修正文档中的过期能力声明。 | 22 个离线测试、依赖锁检查、补丁格式检查和代码文件覆盖检查均通过。 |
-| 2026-09-07 | 本次开发指引提交 | 新增根目录 `AGENTS.md`，固化文档阅读顺序、开发边界、提问条件和验证/推送规则。 | 文档引用、提问规则和补丁格式检查通过；提交前复跑完整离线基线。 |
+| 2026-09-07 | `2fdb03c` | 新增根目录 `AGENTS.md`，固化文档阅读顺序、开发边界、提问条件和验证/推送规则。 | 22 个离线测试、依赖锁、文档引用和补丁格式检查通过。 |
+| 2026-09-07 | 本次 Ingest Graph 提交 | 将 raw→Wiki 主路径切换为真实 LangGraph `StateGraph`，接入 SQLite Checkpointer、显式失败分支、结构化覆盖报告和发布前二次完整性门。 | 新增图节点/终态、覆盖失败、审核拒绝、审核期间 raw 变化测试；提交前复跑完整离线基线。 |
 
 ## 5. 项目经历表述验收
 
 | 简历候选表述 | 当前是否可以写成“已实现” | 证据与原因 |
 | --- | --- | --- |
 | 自研领域 Agent Harness | 否 | 只有严格契约和 Checkpointer 骨架；Agent Loop、工具生命周期、Session、压缩和真实恢复未形成闭环。 |
-| 基于 LangGraph 编排 Ingest、QA、Review | 否 | 当前 Ingest 仍是手写流程，QA/Review Graph 未实现。 |
+| 基于 LangGraph 编排 Ingest、QA、Review | 否 | Ingest 已由 LangGraph 编排，但 QA Graph 和语义 Review 节点尚未实现，不能扩大表述为完整多 Agent 编排。 |
 | Wiki 到 PDF 原文的 Evidence 映射 | 可以，限定为 MinerU section evidence | 稳定 ID、原始 block index、页码与 bbox 已实现并有自动测试。 |
 | 渐进式加载 Wiki | 否 | 尚无可运行 QA 工具和入口→正文→Evidence→raw 的 Agent Loop。 |
 | 规则校验 + Review Agent 双阶段审核 | 否 | 只有确定性 Wiki 规则；语义 Wiki/Answer Review 未接入。 |
@@ -68,4 +69,4 @@
 
 ## 6. 下一步
 
-下一最小切片是 P0-B 的真实 Ingest Graph：先为节点顺序、条件分支、checkpoint 恢复和失败不发布添加 fixture/契约测试，再把当前顺序编排拆为 `StateGraph` 节点。随后接入 Wiki Review Chat Client；完成并验证每个切片时同步更新本文件。
+下一最小切片是 P0-B 的 Wiki Review Chat Client：先为严格 verdict 解析、语义 `APPROVE/REVISE/REJECT`、修订反馈、最大尝试次数和失败不发布添加 fixture/契约测试，再接入现有 `StateGraph` 条件循环。中断后续跑与副作用幂等仍属于 P0-D1 的未完成项；完成并验证每个切片时同步更新本文件。
