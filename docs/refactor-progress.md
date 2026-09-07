@@ -57,7 +57,7 @@
 | 2026-09-07 | `2fdb03c` | 新增根目录 `AGENTS.md`，固化文档阅读顺序、开发边界、提问条件和验证/推送规则。 | 22 个离线测试、依赖锁、文档引用和补丁格式检查通过。 |
 | 2026-09-07 | `606e1dd` | 将 raw→Wiki 主路径切换为真实 LangGraph `StateGraph`，接入 SQLite Checkpointer、显式失败分支、结构化覆盖报告和发布前二次完整性门。 | 26 个离线测试、依赖锁、补丁格式、图接线和过期架构声明检查通过。 |
 | 2026-09-07 | `27cf929` | 接入独立 Wiki Review Chat Client、严格 verdict parser、只提交实际引用 Evidence、Review 审计文件和 `REVISE/REJECT` 重生成循环。 | 37 个离线测试、依赖锁、逐文件架构登记、过期声明和补丁格式检查通过。 |
-| 2026-09-07 | 本次只读工具提交 | 实现受控 `read_project_file` 的统一结果契约、路径安全、文件类型处理、文本截断、哈希、资源记录和读取预算。 | 完整基线 51 passed；符号链接不可用时通过 Windows junction 回退完成越界 reparse point 实测。 |
+| 2026-09-07 | `39f0a89` | 实现受控 `read_project_file` 的统一结果契约、路径安全、文件类型处理、文本截断、哈希、资源记录和读取预算。 | 完整基线 51 passed；符号链接不可用时通过 Windows junction 回退完成越界 reparse point 实测。 |
 
 ## 5. 项目经历表述验收
 
