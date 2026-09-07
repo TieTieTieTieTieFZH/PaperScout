@@ -124,6 +124,207 @@ class ReadProjectFileArguments(BaseModel):
     max_chars: int = Field(default=20_000, ge=1, le=50_000)
 
 
+class WikiSectionKind(str, Enum):
+    RESEARCH_QUESTION = "research_question"
+    CORE_IDEA = "core_idea"
+    METHOD = "method"
+    EXPERIMENT_OVERVIEW = "experiment_overview"
+    CONCLUSION_AND_LIMITATIONS = "conclusion_and_limitations"
+
+
+WIKI_SECTION_ORDER = (
+    WikiSectionKind.RESEARCH_QUESTION,
+    WikiSectionKind.CORE_IDEA,
+    WikiSectionKind.METHOD,
+    WikiSectionKind.EXPERIMENT_OVERVIEW,
+    WikiSectionKind.CONCLUSION_AND_LIMITATIONS,
+)
+
+
+class WikiSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: WikiSectionKind
+    content: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def reject_duplicate_evidence(self) -> "WikiSection":
+        if len(self.evidence_ids) != len(set(self.evidence_ids)):
+            raise ValueError("Wiki section evidence IDs must be unique")
+        return self
+
+
+class WikiCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paper_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    sections: list[WikiSection] = Field(min_length=5, max_length=5)
+    input_evidence_ids: list[str] = Field(min_length=1)
+    source_sha256: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_wiki_evidence(self) -> "WikiCandidate":
+        if tuple(section.kind for section in self.sections) != WIKI_SECTION_ORDER:
+            raise ValueError("Wiki sections must use the canonical five-section order")
+        allowed = set(self.input_evidence_ids)
+        if len(allowed) != len(self.input_evidence_ids):
+            raise ValueError("input_evidence_ids must be unique")
+        for section in self.sections:
+            unknown = set(section.evidence_ids) - allowed
+            if unknown:
+                raise ValueError(f"Wiki section cites evidence outside the Ingest input: {sorted(unknown)}")
+            if any(not evidence_id.startswith(f"{self.paper_id}:s") for evidence_id in section.evidence_ids):
+                raise ValueError("Wiki section evidence must belong to the current paper")
+        return self
+
+
+class SessionMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1)
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | dict[str, Any]
+    tool_call_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ReadResourceRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    offset_chars: int = Field(ge=0)
+    returned_chars: int = Field(ge=0)
+    sha256: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class ReadBudget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_calls: int = Field(default=24, ge=1)
+    max_chars_per_call: int = Field(default=50_000, ge=1)
+    max_chars_total: int = Field(default=200_000, ge=1)
+    calls_used: int = Field(default=0, ge=0)
+    chars_used: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_usage(self) -> "ReadBudget":
+        if self.calls_used > self.max_calls or self.chars_used > self.max_chars_total:
+            raise ValueError("read budget usage exceeds its configured limit")
+        return self
+
+
+class ProjectMemory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_goal: str | None = None
+    paper_aliases: dict[str, str] = Field(default_factory=dict)
+    confirmed_decisions: list[str] = Field(default_factory=list)
+    unresolved_questions: list[str] = Field(default_factory=list)
+    research_hypotheses: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class SessionState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+    messages: list[SessionMessage] = Field(default_factory=list)
+    summary: str = ""
+    memory: ProjectMemory = Field(default_factory=ProjectMemory)
+    read_resources: list[ReadResourceRecord] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class RunStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class IngestGraphState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    workspace: str = Field(min_length=1)
+    paper_id: str = Field(min_length=1)
+    status: RunStatus = RunStatus.PENDING
+    input_coverage: EvidenceExtractionReport | None = None
+    input_evidence_ids: list[str] = Field(default_factory=list)
+    candidate_markdown: str | None = None
+    candidate_sha256: str | None = None
+    rule_errors: list[str] = Field(default_factory=list)
+    review: ReviewDecision | None = None
+    attempt: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=2, ge=1)
+    staging_path: str | None = None
+    published: bool = False
+    last_error: str | None = None
+
+
+class QAGraphState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    workspace: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    status: RunStatus = RunStatus.PENDING
+    messages: list[SessionMessage] = Field(default_factory=list)
+    history_summary: str = ""
+    memory: ProjectMemory = Field(default_factory=ProjectMemory)
+    read_resources: list[ReadResourceRecord] = Field(default_factory=list)
+    read_budget: ReadBudget = Field(default_factory=ReadBudget)
+    current_tool_calls: list[AgentToolCall] = Field(default_factory=list)
+    candidate_answer: str | None = None
+    review: ReviewDecision | None = None
+    attempt: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=2, ge=1)
+    last_error: str | None = None
+
+
+class AgentKind(str, Enum):
+    HOST = "host"
+    INGEST = "ingest"
+    QA = "qa"
+    WIKI_REVIEW = "wiki_review"
+    ANSWER_REVIEW = "answer_review"
+
+
+class EventKind(str, Enum):
+    RUN_STARTED = "run.started"
+    MODEL_STARTED = "model.started"
+    MODEL_COMPLETED = "model.completed"
+    TOOL_STARTED = "tool.started"
+    TOOL_COMPLETED = "tool.completed"
+    REVIEW_STARTED = "review.started"
+    REVIEW_COMPLETED = "review.completed"
+    CONTEXT_COMPACTED = "context.compacted"
+    RUN_COMPLETED = "run.completed"
+    RUN_FAILED = "run.failed"
+
+
+class WorkflowEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str = Field(min_length=1)
+    sequence: int = Field(ge=0)
+    run_id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    session_id: str | None = None
+    agent: AgentKind
+    event_type: EventKind
+    timestamp: datetime = Field(default_factory=utc_now)
+    node: str | None = None
+    message: str = ""
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class Evidence(BaseModel):
     evidence_id: str
     paper_id: str
