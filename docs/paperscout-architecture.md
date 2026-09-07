@@ -20,27 +20,30 @@ PDF
   -> 本地校验、staging 审核与原子发布
 ```
 
-`content_list.json` 是 Ingest 的唯一权威来源。宿主按原始数组下标生成 `<paper_id>:eNNNN`；跳过页眉或页脚等噪声块不会改变后续 ID。
+`content_list.json` 是 Ingest 的唯一权威来源。宿主以 `type: text`、`text_level: 2` 标题开始一个 section evidence，并按标题原始数组下标生成 `<paper_id>:sNNNN`；跳过页眉或页脚等噪声块不会改变 ID。
 
-宿主将内容块转换为仅在内存中存在的可引用 Markdown。短论文在首个模型请求中内联；长论文通过受限的 `mineru/citable-evidence.md` 虚拟路径分段读取。`full.md` 仅供人工阅读，不作为 citation 来源。
+宿主将完整 section evidence 转换为可引用 Markdown，并一次性提供给无工具 Ingest Chat Client。第一版使用简单前缀预算；任何截断都会失败关闭，避免在缺少后部实验或结论时发布完整性不明的五栏 Wiki。`full.md` 仅供人工阅读，不作为 citation 来源。
 
 ## 3. Wiki 文件
 
 ```text
 wiki/
 ├── evidence/
-│   └── {paper_id}.jsonl
-├── summaries/
+│   └── {paper_id}/
+│       ├── {section_id}.md
+│       └── {section_id}.json
+├── papers/
 │   └── {paper_id}.md
 ├── indexes/
+│   ├── overview.md
 │   └── sources.json
 └── health/
     └── latest-report.md
 ```
 
-- `evidence/{paper_id}.jsonl`：每行一个非噪声 MinerU 内容块，包含 ID、页码、章节、类型、quote、原始块索引和原始文件定位。
-- `summaries/{paper_id}.md`：固定五栏：研究问题、主要贡献、方法、实验发现、局限性。每栏含 1–3 个 `[evidence:<id>]` 标记。
-- `indexes/sources.json`：唯一索引，保存论文元数据、摘要路径与 evidence 路径。
+- `evidence/{paper_id}/{section_id}.md`：QA 可直接读取的 section 原文；同名 JSON 保存严格结构、block index、页码和 bbox。
+- `papers/{paper_id}.md`：固定五栏：研究问题、核心思路、方法、实验概况、结论与局限。每栏含 1–3 个 `[evidence:<id>]` 标记。
+- `indexes/overview.md`：研究问题和核心思路入口；`sources.json` 保存机器可读路径和来源哈希。
 - 不生成 `concepts/`、`concepts.json`、`chunks.jsonl`、claims 或 method components。
 
 ## 4. Ingest 校验与发布
@@ -58,9 +61,9 @@ Ingest Agent 直接输出 Markdown；宿主添加标题和元数据后写入 Wik
 
 ```text
 用户问题
-  -> sources.json 中的 summaries 检索（至多 3 篇）
+  -> sources.json 中的 papers 检索（至多 3 篇）
   -> 解析命中摘要中的 evidence ID
-  -> 从相应 evidence JSONL 加载这些原文记录
+  -> 从相应 section evidence JSON 加载原文记录
   -> QA Agent 输出答案、evidence ID、页码和 quote
   -> 本地校验 ID、页码和 quote
 ```
@@ -70,3 +73,5 @@ QA 不能引用未由命中摘要加载的 evidence。证据不足时，必须�
 ## 6. 运行记录
 
 每个运行保存状态、事件、模型原始输出、校验错误和最终结果。发布以完整 staging Wiki 的原子替换完成，避免产生半更新的 Wiki。
+
+LangGraph 运行时使用 `runtime/checkpoints.sqlite` 保存 thread checkpoint。Checkpoint、用户可读 Session 和审计事件是三个独立契约；当前阶段已建立 SQLite 生命周期与 `thread_id` 配置骨架，后续 Graph 节点逐步接入。

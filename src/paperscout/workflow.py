@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 import uuid
@@ -11,12 +10,13 @@ from .health import review_wiki, write_health_report_for_wiki
 from .importer import import_preparsed
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
 from .mineru import parse_with_mineru_api
-from .models import AssistantAgentMessage, QAResult, ReadRawToolArguments, ReviewResult, RunEvent, ToolAgentMessage
-from .prompts import INGEST_BUDGET_EXHAUSTED_PROMPT, INGEST_SYSTEM_PROMPT, build_ingest_repair_prompt, build_ingest_user_prompt
+from .evidence import extract_section_evidence
+from .models import QAResult, ReviewResult, RunEvent
+from .prompts import INGEST_SYSTEM_PROMPT, build_ingest_repair_prompt, build_ingest_user_prompt
 from .storage import FileSystemStore, read_json, sha256_file, write_json
 from .wiki import (
-    extract_evidence, migrate_legacy_wiki, render_citable_document, render_summary, retrieve,
-    validate_qa, validate_summary_markdown, write_evidence, write_indexes,
+    migrate_legacy_wiki, render_citable_sections, render_paper_wiki, retrieve,
+    validate_qa, validate_wiki_markdown, write_canonical_indexes, write_section_evidence,
 )
 
 
@@ -31,8 +31,8 @@ class PipelineState(TypedDict, total=False):
     qa_result: dict[str, Any]
 
 
-CITABLE_DOCUMENT_PATH = "mineru/citable-evidence.md"
-MAX_RAW_READS = 24
+class IngestCoverageError(ValueError):
+    pass
 
 
 def _provider(mode: str):
@@ -65,7 +65,7 @@ def _raw_hashes(raw_dir: Path) -> dict[str, str]:
 
 
 def _existing_wiki_for_paper(store: FileSystemStore, paper_id: str) -> bool:
-    if (store.wiki / "summaries" / f"{paper_id}.md").exists() or (store.wiki / "evidence" / f"{paper_id}.jsonl").exists():
+    if (store.wiki / "papers" / f"{paper_id}.md").exists() or (store.wiki / "evidence" / paper_id).exists():
         return True
     sources_path = store.wiki / "indexes" / "sources.json"
     return sources_path.exists() and any(item.get("paper_id") == paper_id for item in read_json(sources_path))
@@ -88,90 +88,69 @@ def prepare_ingest_context(store: FileSystemStore, paper_id: str, context_window
     paper = read_json(metadata_path)
     if paper.get("paper_id") != paper_id:
         raise ValueError("metadata.json paper_id does not match the requested paper_id")
-    evidence = extract_evidence(raw_dir, paper_id)
-    if not evidence:
+    bundle = extract_section_evidence(raw_dir, paper_id)
+    eligible = [item for item in bundle.evidence if item.eligible_for_ingest]
+    if not eligible:
         raise ValueError("No usable evidence could be extracted from raw MinerU output")
-    citable_document = render_citable_document(evidence)
+    input_budget = max(1, context_window // 2)
+    selected = []
+    for item in eligible:
+        proposed = render_citable_sections([*selected, item])
+        if len(proposed) > input_budget:
+            break
+        selected.append(item)
+    truncated = len(selected) < len(eligible)
+    coverage = bundle.report.model_copy(
+        update={
+            "truncated": truncated,
+            "last_included_content_index": selected[-1].end_content_index if selected else None,
+        }
+    )
+    if truncated:
+        raise IngestCoverageError(
+            "Ingest input exceeds the simple prefix budget; refusing to publish an incomplete five-section Wiki "
+            f"({len(selected)}/{len(eligible)} eligible sections, budget={input_budget} chars)"
+        )
+    citable_document = render_citable_sections(selected)
     return {
         "raw_dir": raw_dir,
         "paper": paper,
-        "evidence": evidence,
+        "evidence": selected,
+        "coverage": coverage,
         "citable_document": citable_document,
-        "inline_document": citable_document if len(citable_document) <= context_window // 2 else None,
-        "per_read_chars": max(1, context_window // 4),
-        "total_chars": max(1, (context_window * 3) // 4),
         "raw_hashes": _raw_hashes(raw_dir),
     }
 
 
-def _read_citable_document(context: dict[str, Any], call: ReadRawToolArguments, remaining_chars: int) -> dict[str, Any]:
-    if call.path != CITABLE_DOCUMENT_PATH:
-        return {"error": f"只允许读取 {CITABLE_DOCUMENT_PATH}"}
-    content = context["citable_document"]
-    limit = min(call.max_chars or context["per_read_chars"], context["per_read_chars"], remaining_chars)
-    start = min(call.offset_chars, len(content))
-    end = min(start + limit, len(content))
-    return {"path": CITABLE_DOCUMENT_PATH, "offset_chars": start, "content": content[start:end], "truncated": end < len(content)}
-
-
-def _run_ingest_messages(provider: Any, context: dict[str, Any], prompt: str, event_callback: Any | None) -> str:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": INGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-    consumed = 0
-    reads = 0
-    while reads < MAX_RAW_READS and consumed < context["total_chars"]:
-        raw_output = provider.generate_raw_text(messages)
-        try:
-            assistant = AssistantAgentMessage.model_validate(json.loads(raw_output))
-        except (TypeError, json.JSONDecodeError, ValueError):
-            return str(raw_output)
-        if assistant.content is not None or not assistant.tool_calls:
-            return str(raw_output)
-        messages.append(assistant.model_dump(exclude_none=True))
-        for tool_call in assistant.tool_calls:
-            if reads >= MAX_RAW_READS or consumed >= context["total_chars"]:
-                result = {"error": "read_raw 读取额度已耗尽"}
-            elif tool_call.name != "read_raw":
-                result = {"error": f"工具 {tool_call.name} 不在白名单中"}
-            else:
-                try:
-                    arguments = ReadRawToolArguments.model_validate(tool_call.arguments)
-                    result = _read_citable_document(context, arguments, context["total_chars"] - consumed)
-                    consumed += len(result.get("content", ""))
-                    reads += 1
-                    if event_callback:
-                        event_callback("raw_read", "ingest_agent", "Read citable document", {"path": arguments.path, "chars": len(result.get("content", ""))})
-                except ValueError as exc:
-                    result = {"error": f"read_raw 参数无效: {exc}"}
-            messages.append(ToolAgentMessage(role="tool", tool_call_id=tool_call.id, content=result).model_dump())
-    messages.append({"role": "user", "content": INGEST_BUDGET_EXHAUSTED_PROMPT})
-    return provider.generate_raw_text(messages)
-
-
 def ingest_agent(provider: Any, context: dict[str, Any], event_callback: Any | None = None) -> str:
-    prompt = build_ingest_user_prompt(
-        paper=context["paper"], citable_document=context["inline_document"],
-        per_read_chars=context["per_read_chars"], total_chars=context["total_chars"], max_raw_reads=MAX_RAW_READS,
+    prompt = build_ingest_user_prompt(paper=context["paper"], citable_document=context["citable_document"])
+    return provider.generate_raw_text(
+        [{"role": "system", "content": INGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
     )
-    return _run_ingest_messages(provider, context, prompt, event_callback)
 
 
 def repair_ingest_summary(provider: Any, raw_output: str, error: str, context: dict[str, Any]) -> str:
-    prompt = build_ingest_repair_prompt(raw_output=raw_output, validation_error=error, citable_document=context["inline_document"])
-    return _run_ingest_messages(provider, context, prompt, None)
+    prompt = build_ingest_repair_prompt(
+        raw_output=raw_output, validation_error=error, citable_document=context["citable_document"]
+    )
+    return provider.generate_raw_text(
+        [{"role": "system", "content": INGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+    )
 
 
-def render_wiki(store: FileSystemStore, state: PipelineState, context: dict[str, Any], summary_body: str) -> Path:
+def render_wiki(store: FileSystemStore, state: PipelineState, context: dict[str, Any], candidate: Any) -> Path:
     """Publish only deterministic artifacts derived from a validated Markdown body."""
     store.run_dir(state["run_id"]).mkdir(parents=True, exist_ok=True)
-    (store.run_dir(state["run_id"]) / "ingest-summary.md").write_text(summary_body, encoding="utf-8")
+    paper_markdown = render_paper_wiki(context["paper"], candidate)
+    (store.run_dir(state["run_id"]) / "ingest-summary.md").write_text(paper_markdown, encoding="utf-8")
     staging = store.prepare_staging_wiki(state["run_id"])
     migrate_legacy_wiki(staging)
     paper_id = state["paper_id"]
-    write_evidence(staging / "evidence" / f"{paper_id}.jsonl", context["evidence"])
-    summary_path = staging / "summaries" / f"{paper_id}.md"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(render_summary(context["paper"], summary_body), encoding="utf-8")
-    write_indexes(staging, context["paper"], summary_path)
+    write_section_evidence(staging, context["evidence"])
+    paper_path = staging / "papers" / f"{paper_id}.md"
+    paper_path.parent.mkdir(parents=True, exist_ok=True)
+    paper_path.write_text(paper_markdown, encoding="utf-8")
+    write_canonical_indexes(staging, context["paper"], candidate)
     return staging
 
 
@@ -185,7 +164,18 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
         state["current_node"] = "prepare_ingest_context"
         _event(store, state, "node_started", state["current_node"], "Preparing citable raw evidence")
         context = prepare_ingest_context(store, paper_id, window)
-        _event(store, state, "node_completed", state["current_node"], "Prepared citable document", {"evidence_count": len(context["evidence"]), "inlined": context["inline_document"] is not None})
+        _event(
+            store,
+            state,
+            "node_completed",
+            state["current_node"],
+            "Prepared section evidence",
+            {
+                "evidence_count": len(context["evidence"]),
+                "truncated": context["coverage"].truncated,
+                "last_included_content_index": context["coverage"].last_included_content_index,
+            },
+        )
 
         callback = lambda event_type, node, message, data: _event(store, state, event_type, node, message, data)
         state["current_node"] = "ingest_agent"
@@ -193,14 +183,14 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
         raw_output = ingest_agent(provider, context, callback)
         (store.run_dir(state["run_id"]) / "ingest-output-1.md").write_text(raw_output, encoding="utf-8")
         try:
-            summary_body = validate_summary_markdown(raw_output, context["evidence"])
+            candidate = validate_wiki_markdown(raw_output, paper=context["paper"], evidence=context["evidence"])
         except ValueError as first_error:
             write_json(store.run_dir(state["run_id"]) / "validation-errors-1.json", {"error": str(first_error)})
             _event(store, state, "validation_failed", "validate_summary_markdown", str(first_error), {"attempt": 1})
             repaired = repair_ingest_summary(provider, raw_output, str(first_error), context)
             (store.run_dir(state["run_id"]) / "ingest-output-2.md").write_text(repaired, encoding="utf-8")
             try:
-                summary_body = validate_summary_markdown(repaired, context["evidence"])
+                candidate = validate_wiki_markdown(repaired, paper=context["paper"], evidence=context["evidence"])
             except ValueError as second_error:
                 write_json(store.run_dir(state["run_id"]) / "validation-errors-2.json", {"error": str(second_error)})
                 result = {"status": "failed", "paper_id": paper_id, "error": str(second_error), "run_id": state["run_id"]}
@@ -211,7 +201,7 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
         if _raw_hashes(context["raw_dir"]) != context["raw_hashes"]:
             raise RuntimeError("Raw input changed during ingest; refusing to publish")
         state["current_node"] = "render_wiki"
-        staging = render_wiki(store, state, context, summary_body)
+        staging = render_wiki(store, state, context, candidate)
         write_health_report_for_wiki(staging)
         reviewed = review_wiki(staging)
         state["review"] = reviewed.model_dump()

@@ -42,10 +42,10 @@ class MockLLM:
         citation = f"[evidence:{evidence_ids[0]}]"
         return "\n\n".join([
             "## 研究问题\n\n论文研究一个可由原文证据核查的问题。\n\n" + citation,
-            "## 主要贡献\n\n论文提出了可验证的方法或系统贡献。\n\n" + citation,
+            "## 核心思路\n\n论文提出了可验证的方法或系统思路。\n\n" + citation,
             "## 方法\n\n方法依据论文原文组织处理流程。\n\n" + citation,
-            "## 实验发现\n\n论文报告了与研究问题相关的评估结果。\n\n" + citation,
-            "## 局限性\n\n结论应限于论文报告的范围。\n\n" + citation,
+            "## 实验概况\n\n论文报告了与研究问题相关的评估设计。\n\n" + citation,
+            "## 结论与局限\n\n结论应限于论文报告的范围。\n\n" + citation,
         ])
 
     def generate_qa(self, question: str, chunks: list[dict[str, Any]]) -> dict[str, Any]:

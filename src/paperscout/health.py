@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .models import ReviewResult
 from .storage import read_json
-from .wiki import read_evidence, validate_summary_markdown
+from .wiki import read_section_evidence, validate_wiki_markdown
 
 
 def review_wiki(wiki: Path) -> ReviewResult:
@@ -18,19 +18,19 @@ def review_wiki(wiki: Path) -> ReviewResult:
     evidence_count = 0
     for source in sources:
         paper_id = source.get("paper_id", "")
-        evidence_path = wiki / source.get("evidence_path", "")
-        summary_path = wiki / source.get("summary_path", "")
-        if not evidence_path.is_file():
-            issues.append(f"Missing evidence file: {source.get('evidence_path')}")
+        evidence_path = wiki / source.get("evidence_dir", "")
+        summary_path = wiki / source.get("paper_path", "")
+        if not evidence_path.is_dir():
+            issues.append(f"Missing evidence directory: {source.get('evidence_dir')}")
             continue
         if not summary_path.is_file():
             issues.append(f"Missing summary file: {source.get('summary_path')}")
-        evidence = read_evidence(evidence_path)
+        evidence = read_section_evidence(evidence_path)
         if summary_path.is_file():
             try:
-                validate_summary_markdown(summary_path.read_text(encoding="utf-8"), evidence)
+                validate_wiki_markdown(summary_path.read_text(encoding="utf-8"), paper=source, evidence=evidence)
             except ValueError as exc:
-                issues.append(f"Invalid summary {source.get('summary_path')}: {exc}")
+                issues.append(f"Invalid Wiki {source.get('paper_path')}: {exc}")
         evidence_count += len(evidence)
         for item in evidence:
             if item.evidence_id in all_evidence:

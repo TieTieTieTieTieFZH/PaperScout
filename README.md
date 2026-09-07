@@ -67,7 +67,7 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 - **raw → Wiki**：调用 `run_ingest_from_raw()`；它只读取已有的 `raw/papers/{paper_id}/metadata.json` 与 `mineru/content_list.json`，不会调用 MinerU、复制 PDF、修改或删除 raw。
 - **PDF → raw → Wiki**：`run_ingest()` 完成导入后复用与 `run_ingest_from_raw()` 相同的校验、渲染和发布流程。
 
-宿主只使用当前论文的 `mineru/content_list.json` 生成带 evidence ID、页码和章节的可引用 Markdown。短论文会随首个请求内联；长论文通过受限 `read_raw` 读取内存中的 `mineru/citable-evidence.md`。Ingest Agent 直接输出五栏 Markdown 摘要及 evidence 标记，不能选择 Wiki 路径或写入文件。
+宿主只使用当前论文的 `mineru/content_list.json`，按 `type: text`、`text_level: 2` 聚合 section evidence。Evidence ID 使用二级标题在原始数组中的下标，例如 `<paper_id>:s0042`。Ingest 是无工具 Chat Client；输入必须一次性完整装入预算，若简单前缀会发生截断则失败关闭，不生成不完整 Wiki。
 
 ## Python API
 
@@ -106,7 +106,7 @@ run_ingest_from_raw(
 )
 ```
 
-如果同一 `paper_id` 已有摘要、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。发布时会对完整 staging Wiki 执行本地规则审核，审核失败不会向 `wiki/` 发布任何文件。
+如果同一 `paper_id` 已有 Wiki、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。发布时会对完整 staging Wiki 执行本地规则审核，审核失败不会向 `wiki/` 发布任何文件。
 
 升级已有 Wiki 时，执行一次 `migrate_wiki(workspace)`；它会在 staging 中移除旧的概念与 chunks 产物，再通过健康检查后原子发布。
 
@@ -140,9 +140,17 @@ llmwiki/
 │           └── task.json
 ├── wiki/
 │   ├── evidence/
+│   │   └── {paper_id}/
+│   │       ├── {section_id}.md
+│   │       └── {section_id}.json
 │   ├── indexes/
-│   ├── summaries/
+│   │   ├── overview.md
+│   │   └── sources.json
+│   ├── papers/
+│   │   └── {paper_id}.md
 │   └── health/
+├── runtime/
+│   └── checkpoints.sqlite
 └── runs/
     └── {run_id}/
         ├── state.json
