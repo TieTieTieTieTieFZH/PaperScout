@@ -27,6 +27,7 @@ from .models import (
 )
 from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
 from .read_tool import model_visible_read_result, read_project_file
+from .session import load_session, merge_project_memory, merge_read_resources, persist_session
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
 
 
@@ -119,6 +120,7 @@ def _new_state(
     llm_mode: str,
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
+    session, history = load_session(store.workspace, session_id)
     run_id = uuid.uuid4().hex
     state = QAGraphState(
         run_id=run_id,
@@ -128,8 +130,12 @@ def _new_state(
         question=question,
         llm_mode=llm_mode,
         status=RunStatus.RUNNING,
-        messages=[_message("user", question)],
+        messages=[*history, _message("user", question)],
+        history_summary=session.summary,
+        memory=session.memory,
+        session_read_resources=session.read_resources,
         read_budget=read_budget or ReadBudget(),
+        turn_start_message_index=len(history),
     )
     _event(store, state, EventKind.RUN_STARTED, "qa", "QA run started", agent=AgentKind.QA)
     return state
@@ -185,7 +191,11 @@ def build_qa_graph(
             messages = list(state.messages)
             parsed_payload = parsed.model_dump(mode="json")
             if isinstance(parsed, QAToolCallEnvelope):
-                used_ids = {message.tool_call_id for message in messages if message.tool_call_id}
+                used_ids = {
+                    message.tool_call_id
+                    for message in messages[state.turn_start_message_index :]
+                    if message.tool_call_id
+                }
                 if parsed.id in used_ids:
                     raise ValueError(f"duplicate QA tool call id: {parsed.id}")
                 messages.append(_message("assistant", parsed_payload, parsed.id))
@@ -331,6 +341,19 @@ def build_qa_graph(
         if state.candidate_answer is None:
             return {"current_node": state.current_node, "last_error": "QA final answer is missing"}
         answer = state.candidate_answer
+        memory = merge_project_memory(state.memory, answer.memory_patch)
+        session_resources = merge_read_resources(state.session_read_resources, state.read_resources)
+        try:
+            session = persist_session(
+                store.workspace,
+                session_id=state.session_id,
+                messages=state.messages,
+                summary=state.history_summary,
+                memory=memory,
+                read_resources=session_resources,
+            )
+        except Exception as exc:
+            raise RetryableNodeError(f"QA session persistence failed: {exc}") from exc
         result = {
             "status": "completed",
             "run_id": state.run_id,
@@ -350,6 +373,10 @@ def build_qa_graph(
             "current_node": state.current_node,
             "event_sequence": state.event_sequence,
             "status": RunStatus.COMPLETED.value,
+            "memory": session.memory.model_dump(mode="json"),
+            "session_read_resources": [
+                record.model_dump(mode="json") for record in session.read_resources
+            ],
             "result": result,
             "last_error": None,
         }

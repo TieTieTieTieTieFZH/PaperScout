@@ -8,7 +8,15 @@ import pytest
 from pydantic import ValidationError
 
 from paperscout.graph_runtime import GraphRuntime, graph_config
-from paperscout.models import AgentToolCall, EventKind, QAAnswer, ReadBudget, WorkflowEvent
+from paperscout.models import (
+    AgentToolCall,
+    EventKind,
+    QAAnswer,
+    ReadBudget,
+    SessionMessage,
+    SessionState,
+    WorkflowEvent,
+)
 from paperscout.qa import build_qa_graph, parse_qa_model_response, resume_qa, run_qa
 from paperscout.read_tool import model_visible_read_result, read_project_file
 
@@ -40,6 +48,7 @@ def _final(
     claims: list[dict[str, Any]],
     cited_evidence_ids: list[str],
     status: str = "answered",
+    memory_patch: dict[str, Any] | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -48,7 +57,8 @@ def _final(
             "claims": claims,
             "cited_evidence_ids": cited_evidence_ids,
             "status": status,
-            "memory_patch": {
+            "memory_patch": memory_patch
+            or {
                 "research_goal": None,
                 "paper_aliases": {},
                 "confirmed_decisions": [],
@@ -553,3 +563,191 @@ def test_malformed_or_unread_final_answer_fails_closed(
     assert result["status"] == "failed"
     assert error in result["error"]
     assert (workspace / "runs" / result["run_id"] / "result.json").is_file()
+
+
+def test_completed_qa_persists_user_readable_session_without_tool_text_in_state(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    provider = ScriptedProvider(
+        [
+            _tool_call("call-session", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    result = run_qa(workspace, "方法？", "session-files", provider=provider)
+
+    assert result["status"] == "completed"
+    session_dir = workspace / "memory" / "sessions" / "session-files"
+    state_payload = json.loads((session_dir / "state.json").read_text(encoding="utf-8"))
+    state = SessionState.model_validate(state_payload)
+    messages = [
+        SessionMessage.model_validate_json(line)
+        for line in (session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [message.role for message in messages] == ["user", "assistant", "tool", "assistant"]
+    assert "该方法使用可核查的处理流程" in json.dumps(
+        messages[2].content, ensure_ascii=False
+    )
+    assert state.session_id == "session-files"
+    assert state.messages == []
+    assert state.memory.evidence_ids == ["paper-1:s0001"]
+    assert [record.path for record in state.read_resources] == ["wiki/papers/paper-1.md"]
+    assert "messages" not in state_payload
+    assert "该方法使用可核查的处理流程" not in json.dumps(
+        state_payload, ensure_ascii=False
+    )
+    assert (session_dir / "summary.md").read_text(encoding="utf-8") == ""
+
+
+def test_same_session_continues_with_history_memory_and_reused_tool_call_ids(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    first = run_qa(
+        workspace,
+        "先读论文 Wiki。",
+        "session-continue",
+        provider=ScriptedProvider(
+            [
+                _tool_call("shared-call", "wiki/papers/paper-1.md"),
+                _final(
+                    answer="已读取论文方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "论文记录了方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                    memory_patch={
+                        "research_goal": "核对论文方法",
+                        "paper_aliases": {"第一篇": "paper-1"},
+                        "unresolved_questions": ["方法如何实现？"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    },
+                ),
+            ]
+        ),
+    )
+    second_provider = ScriptedProvider(
+        [
+            _tool_call("shared-call", "wiki/evidence/paper-1/s0001.md"),
+            _final(
+                answer="原文证据支持该方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "原文证据支持该方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+                memory_patch={
+                    "paper_aliases": {"这篇论文": "paper-1"},
+                    "confirmed_decisions": ["继续核对原文"],
+                    "unresolved_questions": ["方法如何实现？", "实验如何验证？"],
+                    "evidence_ids": ["paper-1:s0001"],
+                },
+            ),
+        ]
+    )
+
+    second = run_qa(
+        workspace,
+        "再核对原文证据。",
+        "session-continue",
+        provider=second_provider,
+    )
+
+    assert first["status"] == "completed"
+    assert second["status"] == "completed"
+    first_request = second_provider.requests[0]
+    assert any(message.get("content") == "先读论文 Wiki。" for message in first_request)
+    assert first_request[-1]["content"] == "再核对原文证据。"
+    assert "paper-1:s0001" in first_request[1]["content"]
+    session_dir = workspace / "memory" / "sessions" / "session-continue"
+    messages = (session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+    state = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert len(messages) == 8
+    assert state.memory.research_goal == "核对论文方法"
+    assert state.memory.paper_aliases == {"第一篇": "paper-1", "这篇论文": "paper-1"}
+    assert state.memory.confirmed_decisions == ["继续核对原文"]
+    assert state.memory.unresolved_questions == ["方法如何实现？", "实验如何验证？"]
+    assert state.memory.evidence_ids == ["paper-1:s0001"]
+    assert [record.path for record in state.read_resources] == [
+        "wiki/papers/paper-1.md",
+        "wiki/evidence/paper-1/s0001.md",
+    ]
+
+
+def test_session_id_cannot_escape_the_session_root(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="session_id"):
+        run_qa(workspace, "问题", "../outside", provider=ScriptedProvider([]))
+
+    assert not (workspace / "memory" / "outside").exists()
+
+
+def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    provider = ScriptedProvider(
+        [
+            _final(
+                answer="当前资料不足。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "paperscout.qa.persist_session",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("temporary session failure")),
+        )
+        interrupted = run_qa(
+            workspace,
+            "问题",
+            "session-persist-resume",
+            provider=provider,
+        )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["complete_qa"]
+    assert "temporary session failure" in interrupted["error"]
+    assert len(provider.requests) == 1
+
+    no_call_provider = ScriptedProvider([])
+    result = resume_qa(
+        workspace,
+        interrupted["thread_id"],
+        provider=no_call_provider,
+    )
+
+    assert result["status"] == "completed"
+    assert not no_call_provider.requests
+    session_dir = workspace / "memory" / "sessions" / "session-persist-resume"
+    assert (session_dir / "state.json").is_file()
+    assert (session_dir / "messages.jsonl").is_file()
+    assert (session_dir / "summary.md").is_file()
