@@ -573,3 +573,11 @@ Answer Review
 | 会话记忆 | 保存当前对话、已读资料和未解决问题 |
 | 长期记忆 | 保存用户研究方向、项目决策和研究假设 |
 
+## 15. Checkpoint 与恢复
+
+QA Graph 可以通过 `interrupt_before` 在模型或工具节点前暂停，返回 `thread_id`、下一节点和当前读取预算。`resume_qa()` 在新 runtime 中核对 workspace、thread 与 `llm_mode` 后继续执行；终态重复 resume 直接返回已保存结果，不再次调用模型或工具。
+
+每个模型步骤原子保存 `qa-output-{step}.txt`，每次工具调用原子保存 request 与完整 result。若副作用已经持久化但 Graph Checkpoint 尚未推进，恢复节点会校验请求并重放结果；工具预算与已读资源因此只更新一次。瞬时模型或工具异常会保留失败节点之前的 Checkpoint，并返回可重试的 `interrupted`。非法 JSON、伪造 Evidence 和审计请求冲突仍失败关闭。
+
+远程模型请求在响应尚未写入运行目录的在途窗口可能重发；除非 Provider 提供幂等键，否则不承诺计费级 exactly-once。Checkpoint 仍不代替 `messages.jsonl`、`state.json`、`summary.md` 等用户可读 Session 契约。
+

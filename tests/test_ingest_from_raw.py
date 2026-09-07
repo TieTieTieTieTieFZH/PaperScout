@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,8 +10,18 @@ from types import SimpleNamespace
 import pytest
 
 from paperscout.graph_runtime import GraphRuntime, graph_config
-from paperscout.models import AgentKind, EventKind, ReviewDecision, ReviewVerdict, WorkflowEvent
-from paperscout.workflow import build_ingest_graph, run_ingest_from_raw
+from paperscout.models import (
+    AgentKind,
+    EventKind,
+    IngestGraphState,
+    ReviewDecision,
+    ReviewVerdict,
+    WorkflowEvent,
+)
+from paperscout.prompts import build_wiki_review_prompt
+from paperscout.storage import FileSystemStore, write_text_atomic
+from paperscout.wiki import render_citable_sections, validate_wiki_markdown
+from paperscout.workflow import build_ingest_graph, resume_ingest, run_ingest_from_raw
 
 
 PAPER_ID = "2409.18839v1"
@@ -51,6 +62,26 @@ def _summary(evidence_id: str = f"{PAPER_ID}:s0001") -> str:
     ])
 
 
+def test_atomic_text_write_preserves_previous_file_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "audit" / "result.txt"
+    target.parent.mkdir()
+    target.write_text("previous", encoding="utf-8")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("paperscout.storage.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        write_text_atomic(target, "replacement")
+
+    assert target.read_text(encoding="utf-8") == "previous"
+    assert list(target.parent.iterdir()) == [target]
+
+
 class SequenceProvider:
     def __init__(self, outputs: list[str], mutate: callable | None = None):
         self.outputs = outputs
@@ -65,6 +96,261 @@ class SequenceProvider:
         value = self.outputs[self.calls]
         self.calls += 1
         return value
+
+
+def test_ingest_resumes_after_checkpointed_model_interrupt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    initial_provider = SequenceProvider([_summary()])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: initial_provider)
+
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["ingest_agent"],
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["ingest_agent"]
+    assert initial_provider.calls == 0
+    assert not (tmp_path / "wiki").exists()
+
+    resumed_provider = SequenceProvider([_summary()])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: resumed_provider)
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert resumed_provider.calls == 1
+    events_path = tmp_path / "runs" / result["run_id"] / "events.jsonl"
+    events = [WorkflowEvent.model_validate_json(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event.sequence for event in events] == list(range(len(events)))
+    assert EventKind.RUN_INTERRUPTED in [event.event_type for event in events]
+    assert EventKind.RUN_RESUMED in [event.event_type for event in events]
+
+    event_count = len(events)
+    no_call_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: no_call_provider)
+    repeated = resume_ingest(tmp_path, interrupted["thread_id"])
+    assert repeated == result
+    assert no_call_provider.calls == 0
+    assert len(events_path.read_text(encoding="utf-8").splitlines()) == event_count
+
+
+def test_ingest_transient_model_failure_remains_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    failing_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: failing_provider)
+
+    interrupted = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["retryable"] is True
+    assert interrupted["next_nodes"] == ["ingest_agent"]
+    assert len(failing_provider.messages) == 1
+
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([_summary()]))
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+    assert result["status"] == "published"
+
+
+def test_ingest_resume_replays_durable_model_output_without_second_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["ingest_agent"],
+    )
+    run_dir = tmp_path / "runs" / interrupted["run_id"]
+    (run_dir / "ingest-output-1.md").write_text(_summary(), encoding="utf-8")
+    no_call_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: no_call_provider)
+
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert no_call_provider.calls == 0
+
+
+def test_ingest_resume_recognizes_publish_completed_before_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    provider = SequenceProvider([_summary()])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: provider)
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["publish_wiki"],
+    )
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["publish_wiki"]
+    store = FileSystemStore(tmp_path)
+    store.publish_staged_wiki(interrupted["run_id"])
+    assert (tmp_path / "wiki" / "papers" / f"{PAPER_ID}.md").is_file()
+
+    no_call_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: no_call_provider)
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert no_call_provider.calls == 0
+    assert not (tmp_path / "runs" / result["run_id"] / "published-wiki-backup").exists()
+
+
+@pytest.mark.parametrize("crash_phase", ["after_backup", "after_publish"])
+def test_ingest_resume_repairs_each_atomic_publish_crash_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_phase: str
+) -> None:
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "existing.md").write_text("preserve me", encoding="utf-8")
+    _raw_tree(tmp_path)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([_summary()]))
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["publish_wiki"],
+    )
+    run_dir = tmp_path / "runs" / interrupted["run_id"]
+    staging = run_dir / "staging" / "wiki"
+    backup = run_dir / "published-wiki-backup"
+    os.replace(tmp_path / "wiki", backup)
+    if crash_phase == "after_publish":
+        os.replace(staging, tmp_path / "wiki")
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert (tmp_path / "wiki" / "existing.md").read_text(encoding="utf-8") == "preserve me"
+    assert (tmp_path / "wiki" / "papers" / f"{PAPER_ID}.md").is_file()
+    assert not backup.exists()
+    assert not staging.exists()
+
+
+def test_ingest_resume_rolls_back_changed_staging_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "existing.md").write_text("preserve me", encoding="utf-8")
+    _raw_tree(tmp_path)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([_summary()]))
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["publish_wiki"],
+    )
+    staging = tmp_path / "runs" / interrupted["run_id"] / "staging" / "wiki"
+    (staging / "papers" / f"{PAPER_ID}.md").write_text("tampered", encoding="utf-8")
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "failed"
+    assert "staging manifest" in result["error"]
+    assert (tmp_path / "wiki" / "existing.md").read_text(encoding="utf-8") == "preserve me"
+    assert not (tmp_path / "wiki" / "papers" / f"{PAPER_ID}.md").exists()
+    assert not (tmp_path / "runs" / result["run_id"] / "published-wiki-backup").exists()
+
+
+def test_ingest_resume_replays_durable_review_without_second_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    ingest_provider = SequenceProvider([_summary()])
+    initial_review_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: ingest_provider)
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: initial_review_provider)
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["wiki_review"],
+    )
+    with GraphRuntime.open(tmp_path) as runtime:
+        graph = build_ingest_graph(runtime, provider=SequenceProvider([]), context_window=128_000)
+        snapshot = graph.get_state(graph_config(interrupted["thread_id"]))
+    state = IngestGraphState.model_validate(snapshot.values)
+    candidate = validate_wiki_markdown(
+        state.candidate_markdown or "",
+        paper=state.paper or {},
+        evidence=state.evidence,
+    )
+    cited_ids = {evidence_id for section in candidate.sections for evidence_id in section.evidence_ids}
+    request = build_wiki_review_prompt(
+        paper=state.paper or {},
+        candidate_markdown=state.candidate_markdown or "",
+        evidence_document=render_citable_sections(
+            [item for item in state.evidence if item.evidence_id in cited_ids]
+        ),
+    )
+    audit = tmp_path / "runs" / interrupted["run_id"] / "review" / "wiki" / "1"
+    audit.mkdir(parents=True)
+    (audit / "request.md").write_text(request, encoding="utf-8")
+    (audit / "response.md").write_text("VERDICT: APPROVE\n", encoding="utf-8")
+    (audit / "result.json").write_text(
+        json.dumps(ReviewDecision(verdict=ReviewVerdict.APPROVE).model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    no_call_review_provider = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: no_call_review_provider)
+
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert no_call_review_provider.calls == 0
+
+
+def test_ingest_transient_review_failure_remains_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([_summary()]))
+    failing_review = SequenceProvider([])
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: failing_review)
+
+    interrupted = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["retryable"] is True
+    assert interrupted["next_nodes"] == ["wiki_review"]
+    assert len(failing_review.messages) == 1
+
+    resumed_review = SequenceProvider(["VERDICT: APPROVE\n"])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: resumed_review)
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert resumed_review.calls == 1
+
+
+def test_ingest_resume_rebuilds_only_partial_run_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = _raw_tree(tmp_path)
+    before = _hash_tree(raw)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([_summary()]))
+    interrupted = run_ingest_from_raw(
+        tmp_path,
+        PAPER_ID,
+        interrupt_before=["render_wiki"],
+    )
+    staging = tmp_path / "runs" / interrupted["run_id"] / "staging" / "wiki"
+    staging.mkdir(parents=True)
+    (staging / "partial.txt").write_text("incomplete", encoding="utf-8")
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: SequenceProvider([]))
+
+    result = resume_ingest(tmp_path, interrupted["thread_id"])
+
+    assert result["status"] == "published"
+    assert _hash_tree(raw) == before
+    assert not (tmp_path / "wiki" / "partial.txt").exists()
 
 
 def test_raw_to_wiki_renders_five_sections_and_preserves_raw(tmp_path: Path) -> None:

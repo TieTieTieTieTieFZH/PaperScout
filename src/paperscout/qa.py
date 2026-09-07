@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from langgraph.graph import END, START, StateGraph
 from pydantic import Field, TypeAdapter, ValidationError
 
-from .graph_runtime import GraphRuntime, graph_config
+from .graph_runtime import GraphRuntime, RetryableNodeError, graph_config
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
 from .models import (
     AgentKind,
@@ -20,13 +20,14 @@ from .models import (
     QAGraphState,
     QAToolCallEnvelope,
     ReadBudget,
+    ReadProjectFileOutcome,
     RunStatus,
     SessionMessage,
     WorkflowEvent,
 )
 from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
 from .read_tool import model_visible_read_result, read_project_file
-from .storage import FileSystemStore, write_json
+from .storage import FileSystemStore, read_json, write_json, write_text_atomic
 
 
 QAResponseEnvelope = Annotated[QAToolCallEnvelope | QAFinalEnvelope, Field(discriminator="type")]
@@ -72,10 +73,13 @@ def _event(
     *,
     agent: AgentKind = AgentKind.HOST,
 ) -> None:
+    events_path = store.run_dir(state.run_id) / "events.jsonl"
+    persisted_events = len(events_path.read_text(encoding="utf-8").splitlines()) if events_path.exists() else 0
+    sequence = max(state.event_sequence, persisted_events)
     store.append_event(
         WorkflowEvent(
             event_id=uuid.uuid4().hex,
-            sequence=state.event_sequence,
+            sequence=sequence,
             run_id=state.run_id,
             thread_id=state.thread_id,
             session_id=state.session_id,
@@ -86,7 +90,7 @@ def _event(
             data=data or {},
         )
     )
-    state.event_sequence += 1
+    state.event_sequence = sequence + 1
 
 
 def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
@@ -112,6 +116,7 @@ def _new_state(
     store: FileSystemStore,
     question: str,
     session_id: str,
+    llm_mode: str,
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
     run_id = uuid.uuid4().hex
@@ -121,6 +126,7 @@ def _new_state(
         session_id=session_id,
         workspace=str(store.workspace),
         question=question,
+        llm_mode=llm_mode,
         status=RunStatus.RUNNING,
         messages=[_message("user", question)],
         read_budget=read_budget or ReadBudget(),
@@ -129,7 +135,12 @@ def _new_state(
     return state
 
 
-def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
+def build_qa_graph(
+    runtime: GraphRuntime,
+    *,
+    provider: Any,
+    interrupt_before: list[str] | None = None,
+):
     """Compile the QA model/tool loop against the owned SQLite checkpointer."""
 
     def model_node(state: QAGraphState) -> dict[str, Any]:
@@ -141,6 +152,7 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                 "last_error": "QA model step budget is exhausted",
             }
         try:
+            output_path = store.run_dir(state.run_id) / f"qa-output-{state.model_steps + 1}.txt"
             _event(
                 store,
                 state,
@@ -150,17 +162,23 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                 {"model_step": state.model_steps + 1},
                 agent=AgentKind.QA,
             )
-            raw_output = provider.generate_raw_text(_model_messages(state))
-            output_path = store.run_dir(state.run_id) / f"qa-output-{state.model_steps + 1}.txt"
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(raw_output, encoding="utf-8")
+            replayed = output_path.exists()
+            try:
+                if replayed:
+                    raw_output = output_path.read_text(encoding="utf-8")
+                else:
+                    raw_output = provider.generate_raw_text(_model_messages(state))
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(output_path, raw_output)
+            except Exception as exc:
+                raise RetryableNodeError(f"QA model call failed: {exc}") from exc
             _event(
                 store,
                 state,
                 EventKind.MODEL_COMPLETED,
                 state.current_node,
                 "Received QA action",
-                {"model_step": state.model_steps + 1},
+                {"model_step": state.model_steps + 1, "replayed": replayed},
                 agent=AgentKind.QA,
             )
             parsed = parse_qa_model_response(raw_output)
@@ -197,6 +215,8 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                 "model_steps": state.model_steps + 1,
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             return {
                 "current_node": state.current_node,
@@ -223,10 +243,27 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                 {"tool_call_id": call.id},
                 agent=AgentKind.QA,
             )
-            outcome = read_project_file(Path(state.workspace), call.arguments, state.read_budget)
             audit_dir = store.run_dir(state.run_id) / "tools" / f"{state.model_steps:03d}"
-            write_json(audit_dir / "request.json", call.model_dump(mode="json"))
-            write_json(audit_dir / "result.json", outcome.model_dump(mode="json"))
+            request_path = audit_dir / "request.json"
+            result_path = audit_dir / "result.json"
+            replayed = result_path.is_file()
+            if replayed:
+                if not request_path.is_file() or read_json(request_path) != call.model_dump(mode="json"):
+                    raise RuntimeError("QA tool replay request does not match its durable audit")
+                outcome = ReadProjectFileOutcome.model_validate(read_json(result_path))
+            else:
+                request_payload = call.model_dump(mode="json")
+                if request_path.exists() and (
+                    not request_path.is_file() or read_json(request_path) != request_payload
+                ):
+                    raise RuntimeError("QA tool request does not match its durable audit")
+                try:
+                    if not request_path.exists():
+                        write_json(request_path, request_payload)
+                    outcome = read_project_file(Path(state.workspace), call.arguments, state.read_budget)
+                    write_json(result_path, outcome.model_dump(mode="json"))
+                except Exception as exc:
+                    raise RetryableNodeError(f"QA tool execution failed: {exc}") from exc
             visible = model_visible_read_result(outcome)
             _event(
                 store,
@@ -238,6 +275,7 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                     "tool_call_id": call.id,
                     "ok": visible["ok"],
                     "error_code": outcome.result.error_code,
+                    "replayed": replayed,
                 },
                 agent=AgentKind.QA,
             )
@@ -254,6 +292,8 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
                 "current_tool_calls": [],
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             return {
                 "current_node": state.current_node,
@@ -309,7 +349,7 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
         return {
             "current_node": state.current_node,
             "event_sequence": state.event_sequence,
-            "status": RunStatus.COMPLETED,
+            "status": RunStatus.COMPLETED.value,
             "result": result,
             "last_error": None,
         }
@@ -331,7 +371,7 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
         return {
             "current_node": state.current_node,
             "event_sequence": state.event_sequence,
-            "status": RunStatus.FAILED,
+            "status": RunStatus.FAILED.value,
             "result": result,
         }
 
@@ -371,7 +411,56 @@ def build_qa_graph(runtime: GraphRuntime, *, provider: Any):
     )
     builder.add_edge("complete_qa", END)
     builder.add_edge("fail_qa", END)
-    return runtime.compile(builder)
+    return runtime.compile(builder, interrupt_before=interrupt_before)
+
+
+def _interrupted_qa_outcome(
+    store: FileSystemStore,
+    snapshot: Any,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    if not snapshot.next:
+        raise RuntimeError("QA failure did not leave a resumable checkpoint")
+    paused = QAGraphState.model_validate(snapshot.values)
+    next_nodes = list(snapshot.next)
+    _event(
+        store,
+        paused,
+        EventKind.RUN_INTERRUPTED,
+        paused.current_node or "qa",
+        "QA run interrupted at a checkpoint boundary",
+        {"next_nodes": next_nodes, "error": error},
+        agent=AgentKind.QA,
+    )
+    result = {
+        "status": "interrupted",
+        "run_id": paused.run_id,
+        "thread_id": paused.thread_id,
+        "session_id": paused.session_id,
+        "next_nodes": next_nodes,
+        "retryable": True,
+        "read_budget": paused.read_budget.model_dump(mode="json"),
+    }
+    if error is not None:
+        result["error"] = error
+    store.write_result(paused.run_id, result)
+    return result
+
+
+def _qa_graph_outcome(
+    store: FileSystemStore,
+    graph: Any,
+    config: dict[str, dict[str, str]],
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = graph.get_state(config)
+    if snapshot.next:
+        return _interrupted_qa_outcome(store, snapshot)
+    result = output.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("QA graph completed without a result")
+    return result
 
 
 def run_qa(
@@ -382,18 +471,24 @@ def run_qa(
     *,
     provider: Any | None = None,
     read_budget: ReadBudget | None = None,
+    interrupt_before: list[str] | None = None,
 ) -> dict[str, Any]:
     store = FileSystemStore(workspace)
     selected_provider = provider or _provider(llm_mode)
-    state = _new_state(store, question, session_id, read_budget)
+    state = _new_state(store, question, session_id, llm_mode, read_budget)
     try:
         with GraphRuntime.open(store.workspace) as runtime:
-            graph = build_qa_graph(runtime, provider=selected_provider)
-            final_state = graph.invoke(state.model_dump(mode="json"), graph_config(state.thread_id))
-        result = final_state.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("QA graph completed without a result")
-        return result
+            graph = build_qa_graph(
+                runtime,
+                provider=selected_provider,
+                interrupt_before=interrupt_before,
+            )
+            config = graph_config(state.thread_id)
+            try:
+                final_state = graph.invoke(state.model_dump(mode="json"), config)
+            except RetryableNodeError as exc:
+                return _interrupted_qa_outcome(store, graph.get_state(config), error=str(exc))
+            return _qa_graph_outcome(store, graph, config, final_state)
     except Exception as exc:
         state.status = RunStatus.FAILED
         state.last_error = str(exc)
@@ -411,3 +506,44 @@ def run_qa(
         }
         store.write_result(state.run_id, result)
         return result
+
+
+def resume_qa(
+    workspace: Path,
+    thread_id: str,
+    llm_mode: str = "mock",
+    *,
+    provider: Any | None = None,
+) -> dict[str, Any]:
+    store = FileSystemStore(workspace)
+    config = graph_config(thread_id)
+    with GraphRuntime.open(store.workspace) as runtime:
+        inspection_graph = build_qa_graph(runtime, provider=MockLLM())
+        snapshot = inspection_graph.get_state(config)
+        if not snapshot.values:
+            raise ValueError(f"No QA checkpoint exists for thread_id {thread_id}")
+        state = QAGraphState.model_validate(snapshot.values)
+        if state.thread_id != thread_id or Path(state.workspace).resolve() != store.workspace.resolve():
+            raise ValueError("QA checkpoint does not belong to this workspace or thread")
+        if not snapshot.next:
+            if isinstance(state.result, dict):
+                return state.result
+            raise RuntimeError("QA checkpoint is terminal without a result")
+        if state.llm_mode != llm_mode:
+            raise ValueError(f"QA checkpoint requires llm_mode={state.llm_mode}")
+        selected_provider = provider or _provider(llm_mode)
+        graph = build_qa_graph(runtime, provider=selected_provider)
+        _event(
+            store,
+            state,
+            EventKind.RUN_RESUMED,
+            state.current_node or "qa",
+            "Resuming QA from checkpoint",
+            {"next_nodes": list(snapshot.next)},
+            agent=AgentKind.QA,
+        )
+        try:
+            final_state = graph.invoke(None, config)
+        except RetryableNodeError as exc:
+            return _interrupted_qa_outcome(store, graph.get_state(config), error=str(exc))
+        return _qa_graph_outcome(store, graph, config, final_state)

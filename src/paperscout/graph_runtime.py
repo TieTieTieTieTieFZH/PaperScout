@@ -9,6 +9,10 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.state import StateGraph
 
 
+class RetryableNodeError(RuntimeError):
+    """A transient node-side failure whose pre-node checkpoint can be resumed."""
+
+
 def graph_config(thread_id: str) -> dict[str, dict[str, str]]:
     if not thread_id.strip():
         raise ValueError("thread_id must not be empty")
@@ -33,8 +37,8 @@ class GraphRuntime:
         checkpointer.setup()
         return cls(checkpoint_path=checkpoint_path, connection=connection, checkpointer=checkpointer)
 
-    def compile(self, builder: StateGraph) -> Any:
-        return builder.compile(checkpointer=self.checkpointer)
+    def compile(self, builder: StateGraph, *, interrupt_before: list[str] | None = None) -> Any:
+        return builder.compile(checkpointer=self.checkpointer, interrupt_before=interrupt_before)
 
     def close(self) -> None:
         self.connection.close()

@@ -9,7 +9,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
-from .graph_runtime import GraphRuntime, graph_config
+from .graph_runtime import GraphRuntime, RetryableNodeError, graph_config
 from .health import check_wiki_rules, write_health_report_for_wiki
 from .importer import import_preparsed
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
@@ -20,6 +20,7 @@ from .models import (
     EventKind,
     EvidenceExtractionReport,
     IngestGraphState,
+    ReviewDecision,
     ReviewVerdict,
     RunStatus,
     WorkflowEvent,
@@ -33,7 +34,7 @@ from .prompts import (
     build_wiki_review_prompt,
 )
 from .review import parse_review_response
-from .storage import FileSystemStore, read_json, sha256_file, write_json
+from .storage import FileSystemStore, directory_hashes, read_json, sha256_file, write_json, write_text_atomic
 from .wiki import (
     render_citable_sections, render_paper_wiki, validate_wiki_markdown,
     write_canonical_indexes, write_section_evidence,
@@ -78,10 +79,13 @@ def _event(
     *,
     agent: AgentKind = AgentKind.HOST,
 ) -> None:
+    events_path = store.run_dir(state.run_id) / "events.jsonl"
+    persisted_events = len(events_path.read_text(encoding="utf-8").splitlines()) if events_path.exists() else 0
+    sequence = max(state.event_sequence, persisted_events)
     store.append_event(
         WorkflowEvent(
             event_id=uuid.uuid4().hex,
-            sequence=state.event_sequence,
+            sequence=sequence,
             run_id=state.run_id,
             thread_id=state.thread_id,
             agent=agent,
@@ -91,7 +95,7 @@ def _event(
             data=data or {},
         )
     )
-    state.event_sequence += 1
+    state.event_sequence = sequence + 1
 
 
 def _new_run(store: FileSystemStore, mode: str, paper_id: str) -> IngestGraphState:
@@ -245,6 +249,7 @@ def build_ingest_graph(
     provider: Any,
     context_window: int,
     review_provider: Any | None = None,
+    interrupt_before: list[str] | None = None,
 ):
     """Compile the real Ingest StateGraph against the owned SQLite checkpointer."""
     review_provider = review_provider or MockLLM()
@@ -278,6 +283,7 @@ def build_ingest_graph(
         state.current_node = "ingest_agent"
         store = FileSystemStore(Path(state.workspace))
         try:
+            output_path = store.run_dir(state.run_id) / "ingest-output-1.md"
             _event(
                 store,
                 state,
@@ -286,17 +292,25 @@ def build_ingest_graph(
                 "Requesting Wiki candidate",
                 agent=AgentKind.INGEST,
             )
-            raw_output = ingest_agent(provider, _stored_context(state))
+            replayed = output_path.exists()
+            try:
+                if replayed:
+                    raw_output = output_path.read_text(encoding="utf-8")
+                else:
+                    raw_output = ingest_agent(provider, _stored_context(state))
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(output_path, raw_output)
+            except Exception as exc:
+                raise RetryableNodeError(f"Ingest model call failed: {exc}") from exc
             _event(
                 store,
                 state,
                 EventKind.MODEL_COMPLETED,
                 state.current_node,
                 "Received Wiki candidate",
-                {"attempt": 1},
+                {"attempt": 1, "replayed": replayed},
                 agent=AgentKind.INGEST,
             )
-            (store.run_dir(state.run_id) / "ingest-output-1.md").write_text(raw_output, encoding="utf-8")
             return {
                 "current_node": state.current_node,
                 "event_sequence": state.event_sequence,
@@ -305,6 +319,8 @@ def build_ingest_graph(
                 "candidate_sha256": hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             return {
                 "current_node": state.current_node,
@@ -339,27 +355,41 @@ def build_ingest_graph(
         try:
             if state.candidate_markdown is None or state.last_error is None:
                 raise RuntimeError("Cannot repair without a candidate and validation error")
+            attempt = state.attempt + 1
+            output_path = store.run_dir(state.run_id) / f"ingest-output-{attempt}.md"
             _event(
                 store,
                 state,
                 EventKind.MODEL_STARTED,
                 state.current_node,
                 "Requesting repaired Wiki candidate",
-                {"attempt": state.attempt + 1},
+                {"attempt": attempt},
                 agent=AgentKind.INGEST,
             )
-            repaired = repair_ingest_summary(provider, state.candidate_markdown, state.last_error, _stored_context(state))
-            attempt = state.attempt + 1
+            replayed = output_path.exists()
+            try:
+                if replayed:
+                    repaired = output_path.read_text(encoding="utf-8")
+                else:
+                    repaired = repair_ingest_summary(
+                        provider,
+                        state.candidate_markdown,
+                        state.last_error,
+                        _stored_context(state),
+                    )
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(output_path, repaired)
+            except Exception as exc:
+                raise RetryableNodeError(f"Ingest repair model call failed: {exc}") from exc
             _event(
                 store,
                 state,
                 EventKind.MODEL_COMPLETED,
                 state.current_node,
                 "Received repaired Wiki candidate",
-                {"attempt": attempt},
+                {"attempt": attempt, "replayed": replayed},
                 agent=AgentKind.INGEST,
             )
-            (store.run_dir(state.run_id) / f"ingest-output-{attempt}.md").write_text(repaired, encoding="utf-8")
             return {
                 "current_node": state.current_node,
                 "event_sequence": state.event_sequence,
@@ -368,6 +398,8 @@ def build_ingest_graph(
                 "candidate_sha256": hashlib.sha256(repaired.encode("utf-8")).hexdigest(),
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             return {
                 "current_node": state.current_node,
@@ -399,8 +431,17 @@ def build_ingest_graph(
                 candidate_markdown=state.candidate_markdown,
                 evidence_document=render_citable_sections(cited_evidence),
             )
-            audit.mkdir(parents=True, exist_ok=False)
-            (audit / "request.md").write_text(request, encoding="utf-8")
+            request_path = audit / "request.md"
+            response_path = audit / "response.md"
+            result_path = audit / "result.json"
+            if audit.exists():
+                if not audit.is_dir() or audit.is_symlink():
+                    raise ValueError("Wiki review audit path must be a normal directory")
+                if not request_path.is_file() or request_path.read_text(encoding="utf-8") != request:
+                    raise RuntimeError("Wiki review replay request does not match its durable audit")
+            else:
+                audit.mkdir(parents=True)
+                write_text_atomic(request_path, request)
             _event(
                 store,
                 state,
@@ -410,22 +451,34 @@ def build_ingest_graph(
                 {"attempt": state.attempt, "evidence_ids": sorted(cited_ids)},
                 agent=AgentKind.WIKI_REVIEW,
             )
-            response = review_provider.generate_raw_text(
-                [
-                    {"role": "system", "content": WIKI_REVIEW_SYSTEM_PROMPT},
-                    {"role": "user", "content": request},
-                ]
-            )
-            (audit / "response.md").write_text(response, encoding="utf-8")
-            decision = parse_review_response(response)
-            write_json(audit / "result.json", decision.model_dump(mode="json"))
+            replayed = False
+            if result_path.is_file():
+                decision = ReviewDecision.model_validate(read_json(result_path))
+                replayed = True
+            else:
+                if response_path.is_file():
+                    response = response_path.read_text(encoding="utf-8")
+                    replayed = True
+                else:
+                    try:
+                        response = review_provider.generate_raw_text(
+                            [
+                                {"role": "system", "content": WIKI_REVIEW_SYSTEM_PROMPT},
+                                {"role": "user", "content": request},
+                            ]
+                        )
+                        write_text_atomic(response_path, response)
+                    except Exception as exc:
+                        raise RetryableNodeError(f"Wiki review model call failed: {exc}") from exc
+                decision = parse_review_response(response)
+                write_json(result_path, decision.model_dump(mode="json"))
             _event(
                 store,
                 state,
                 EventKind.REVIEW_COMPLETED,
                 state.current_node,
                 "Completed semantic Wiki review",
-                {"attempt": state.attempt, "verdict": decision.verdict.value},
+                {"attempt": state.attempt, "verdict": decision.verdict.value, "replayed": replayed},
                 agent=AgentKind.WIKI_REVIEW,
             )
             return {
@@ -434,6 +487,8 @@ def build_ingest_graph(
                 "review": decision.model_dump(mode="json"),
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             if audit.is_dir() and not (audit / "result.json").exists():
                 write_json(audit / "result.json", {"status": "failed", "error": str(exc)})
@@ -450,6 +505,7 @@ def build_ingest_graph(
             if state.candidate_markdown is None or state.review is None:
                 raise RuntimeError("Cannot revise without a candidate and semantic review")
             attempt = state.attempt + 1
+            output_path = store.run_dir(state.run_id) / f"ingest-output-{attempt}.md"
             _event(
                 store,
                 state,
@@ -459,23 +515,31 @@ def build_ingest_graph(
                 {"attempt": attempt, "verdict": state.review.verdict.value},
                 agent=AgentKind.INGEST,
             )
-            revised = revise_ingest_summary(
-                provider,
-                state.candidate_markdown,
-                state.review.verdict,
-                state.review.feedback,
-                _stored_context(state),
-            )
+            replayed = output_path.exists()
+            try:
+                if replayed:
+                    revised = output_path.read_text(encoding="utf-8")
+                else:
+                    revised = revise_ingest_summary(
+                        provider,
+                        state.candidate_markdown,
+                        state.review.verdict,
+                        state.review.feedback,
+                        _stored_context(state),
+                    )
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_text_atomic(output_path, revised)
+            except Exception as exc:
+                raise RetryableNodeError(f"Ingest revision model call failed: {exc}") from exc
             _event(
                 store,
                 state,
                 EventKind.MODEL_COMPLETED,
                 state.current_node,
                 "Received regenerated Wiki candidate",
-                {"attempt": attempt},
+                {"attempt": attempt, "replayed": replayed},
                 agent=AgentKind.INGEST,
             )
-            (store.run_dir(state.run_id) / f"ingest-output-{attempt}.md").write_text(revised, encoding="utf-8")
             return {
                 "current_node": state.current_node,
                 "event_sequence": state.event_sequence,
@@ -485,6 +549,8 @@ def build_ingest_graph(
                 "review": None,
                 "last_error": None,
             }
+        except RetryableNodeError:
+            raise
         except Exception as exc:
             return {
                 "current_node": state.current_node,
@@ -506,6 +572,7 @@ def build_ingest_graph(
         state.current_node = "render_wiki"
         try:
             store = FileSystemStore(Path(state.workspace))
+            store.discard_staging_wiki(state.run_id)
             context = _stored_context(state)
             if state.candidate_markdown is None:
                 raise ValueError("Ingest candidate Markdown is missing")
@@ -554,7 +621,9 @@ def build_ingest_graph(
         state.current_node = "publish_wiki"
         store = FileSystemStore(Path(state.workspace))
         try:
-            store.publish_staged_wiki(state.run_id)
+            if not state.staging_hashes:
+                raise RuntimeError("Reviewed staging manifest is missing before publish")
+            store.publish_staged_wiki(state.run_id, expected_hashes=state.staging_hashes)
             state.published = True
             state.status = RunStatus.COMPLETED
             result = {
@@ -641,7 +710,14 @@ def build_ingest_graph(
                 raise RuntimeError("Ingest candidate changed after validation; refusing to publish")
             if state.staging_path is None or not Path(state.staging_path).is_dir():
                 raise RuntimeError("Reviewed staging Wiki is missing before publish")
-            return {"current_node": state.current_node, "last_error": None}
+            staging_hashes = directory_hashes(Path(state.staging_path))
+            if not staging_hashes:
+                raise RuntimeError("Reviewed staging Wiki is empty before publish")
+            return {
+                "current_node": state.current_node,
+                "staging_hashes": staging_hashes,
+                "last_error": None,
+            }
         except Exception as exc:
             return {"current_node": state.current_node, "last_error": str(exc)}
 
@@ -691,10 +767,62 @@ def build_ingest_graph(
     builder.add_conditional_edges("verify_publish", route_error, {"continue": "publish_wiki", "fail": "fail_run"})
     builder.add_conditional_edges("publish_wiki", route_error, {"continue": END, "fail": "fail_run"})
     builder.add_edge("fail_run", END)
-    return runtime.compile(builder)
+    return runtime.compile(builder, interrupt_before=interrupt_before)
 
 
-def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: str) -> dict[str, Any]:
+def _interrupted_ingest_outcome(
+    store: FileSystemStore,
+    snapshot: Any,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    if not snapshot.next:
+        raise RuntimeError("Ingest failure did not leave a resumable checkpoint")
+    paused = IngestGraphState.model_validate(snapshot.values)
+    next_nodes = list(snapshot.next)
+    _event(
+        store,
+        paused,
+        EventKind.RUN_INTERRUPTED,
+        paused.current_node or "ingest",
+        "Ingest run interrupted at a checkpoint boundary",
+        {"next_nodes": next_nodes, "error": error},
+    )
+    result = {
+        "status": "interrupted",
+        "paper_id": paused.paper_id,
+        "run_id": paused.run_id,
+        "thread_id": paused.thread_id,
+        "next_nodes": next_nodes,
+        "retryable": True,
+    }
+    if error is not None:
+        result["error"] = error
+    store.write_result(paused.run_id, result)
+    return result
+
+
+def _ingest_graph_outcome(
+    store: FileSystemStore,
+    graph: Any,
+    config: dict[str, dict[str, str]],
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = graph.get_state(config)
+    if snapshot.next:
+        return _interrupted_ingest_outcome(store, snapshot)
+    result = output.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Ingest graph completed without a result")
+    return result
+
+
+def _run_ingest_from_raw_store(
+    store: FileSystemStore,
+    paper_id: str,
+    llm_mode: str,
+    interrupt_before: list[str] | None = None,
+) -> dict[str, Any]:
     if _existing_wiki_for_paper(store, paper_id):
         raise ValueError(f"Wiki already contains paper_id {paper_id}; refusing to overwrite published artifacts")
     provider = _provider(llm_mode)
@@ -708,12 +836,14 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
                 provider=provider,
                 review_provider=review_provider,
                 context_window=window,
+                interrupt_before=interrupt_before,
             )
-            final_state = graph.invoke(state.model_dump(mode="json"), graph_config(state.thread_id))
-        result = final_state.get("result")
-        if not isinstance(result, dict):
-            raise RuntimeError("Ingest graph completed without a result")
-        return result
+            config = graph_config(state.thread_id)
+            try:
+                final_state = graph.invoke(state.model_dump(mode="json"), config)
+            except RetryableNodeError as exc:
+                return _interrupted_ingest_outcome(store, graph.get_state(config), error=str(exc))
+            return _ingest_graph_outcome(store, graph, config, final_state)
     except Exception as exc:
         state.status = RunStatus.FAILED
         state.last_error = str(exc)
@@ -726,13 +856,66 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
         return result
 
 
-def run_ingest_from_raw(workspace: Path, paper_id: str, llm_mode: str = "mock") -> dict[str, Any]:
-    return _run_ingest_from_raw_store(FileSystemStore(workspace), paper_id, llm_mode)
+def run_ingest_from_raw(
+    workspace: Path,
+    paper_id: str,
+    llm_mode: str = "mock",
+    *,
+    interrupt_before: list[str] | None = None,
+) -> dict[str, Any]:
+    return _run_ingest_from_raw_store(FileSystemStore(workspace), paper_id, llm_mode, interrupt_before)
+
+
+def resume_ingest(workspace: Path, thread_id: str, llm_mode: str = "mock") -> dict[str, Any]:
+    store = FileSystemStore(workspace)
+    config = graph_config(thread_id)
+    with GraphRuntime.open(store.workspace) as runtime:
+        inspection_graph = build_ingest_graph(
+            runtime,
+            provider=MockLLM(),
+            review_provider=MockLLM(),
+            context_window=128_000,
+        )
+        snapshot = inspection_graph.get_state(config)
+        if not snapshot.values:
+            raise ValueError(f"No Ingest checkpoint exists for thread_id {thread_id}")
+        state = IngestGraphState.model_validate(snapshot.values)
+        if state.thread_id != thread_id or Path(state.workspace).resolve() != store.workspace.resolve():
+            raise ValueError("Ingest checkpoint does not belong to this workspace or thread")
+        if not snapshot.next:
+            if isinstance(state.result, dict):
+                return state.result
+            raise RuntimeError("Ingest checkpoint is terminal without a result")
+        if state.llm_mode != llm_mode:
+            raise ValueError(f"Ingest checkpoint requires llm_mode={state.llm_mode}")
+        provider = _provider(llm_mode)
+        review_provider = _review_provider(llm_mode)
+        window = getattr(getattr(provider, "settings", None), "ingest_context_window", 128_000)
+        graph = build_ingest_graph(
+            runtime,
+            provider=provider,
+            review_provider=review_provider,
+            context_window=window,
+        )
+        _event(
+            store,
+            state,
+            EventKind.RUN_RESUMED,
+            state.current_node or "ingest",
+            "Resuming Ingest from checkpoint",
+            {"next_nodes": list(snapshot.next)},
+        )
+        try:
+            final_state = graph.invoke(None, config)
+        except RetryableNodeError as exc:
+            return _interrupted_ingest_outcome(store, graph.get_state(config), error=str(exc))
+        return _ingest_graph_outcome(store, graph, config, final_state)
 
 
 def run_ingest(
     workspace: Path, mineru_path: Path | None = None, source_pdf: Path | None = None, paper_id: str | None = None,
     title: str | None = None, authors: list[str] | None = None, year: int | None = None, llm_mode: str = "mock", *, mineru_token: str | None = None,
+    interrupt_before: list[str] | None = None,
 ) -> dict[str, Any]:
     """Import raw MinerU output if needed, then run the same raw-to-Wiki pipeline."""
     store = FileSystemStore(workspace)
@@ -748,4 +931,4 @@ def run_ingest(
             shutil.rmtree(temporary_mineru_path, ignore_errors=True)
     else:
         imported = import_preparsed(workspace, mineru_path, source_pdf, paper_id, title, authors, year)
-    return _run_ingest_from_raw_store(store, imported.paper_id, llm_mode)
+    return _run_ingest_from_raw_store(store, imported.paper_id, llm_mode, interrupt_before)

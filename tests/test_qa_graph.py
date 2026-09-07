@@ -8,8 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from paperscout.graph_runtime import GraphRuntime, graph_config
-from paperscout.models import QAAnswer, ReadBudget
-from paperscout.qa import build_qa_graph, parse_qa_model_response, run_qa
+from paperscout.models import AgentToolCall, EventKind, QAAnswer, ReadBudget, WorkflowEvent
+from paperscout.qa import build_qa_graph, parse_qa_model_response, resume_qa, run_qa
 from paperscout.read_tool import model_visible_read_result, read_project_file
 
 
@@ -155,6 +155,229 @@ def test_public_qa_api_runs_with_deterministic_mock_provider(tmp_path: Path) -> 
     assert result["answer_status"] == "answered"
     assert result["cited_evidence_ids"] == ["paper-1:s0001"]
     assert result["read_budget"]["calls_used"] == 2
+
+
+def test_qa_resumes_at_tool_boundary_without_duplicate_side_effects(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    initial_provider = ScriptedProvider([_tool_call("call-1", "wiki/papers/paper-1.md")])
+
+    interrupted = run_qa(
+        workspace,
+        "方法？",
+        "session-resume",
+        provider=initial_provider,
+        interrupt_before=["read_project_file"],
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["read_project_file"]
+    assert interrupted["read_budget"]["calls_used"] == 0
+    assert initial_provider.requests
+    assert not (workspace / "runs" / interrupted["run_id"] / "tools").exists()
+
+    final_provider = ScriptedProvider(
+        [
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            )
+        ]
+    )
+    result = resume_qa(workspace, interrupted["thread_id"], provider=final_provider)
+
+    assert result["status"] == "completed"
+    assert result["read_budget"]["calls_used"] == 1
+    assert len(final_provider.requests) == 1
+    tools = list((workspace / "runs" / result["run_id"] / "tools").iterdir())
+    assert len(tools) == 1
+    events_path = workspace / "runs" / result["run_id"] / "events.jsonl"
+    events = [WorkflowEvent.model_validate_json(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event.sequence for event in events] == list(range(len(events)))
+    assert EventKind.RUN_INTERRUPTED in [event.event_type for event in events]
+    assert EventKind.RUN_RESUMED in [event.event_type for event in events]
+
+    event_count = len(events)
+    no_call_provider = ScriptedProvider([])
+    repeated = resume_qa(workspace, interrupted["thread_id"], provider=no_call_provider)
+    assert repeated == result
+    assert not no_call_provider.requests
+    assert len(events_path.read_text(encoding="utf-8").splitlines()) == event_count
+
+
+def test_qa_transient_model_and_tool_failures_remain_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    failed_model = run_qa(
+        workspace,
+        "方法？",
+        "session-model-failure",
+        provider=ScriptedProvider([]),
+    )
+    assert failed_model["status"] == "interrupted"
+    assert failed_model["retryable"] is True
+    assert failed_model["next_nodes"] == ["qa_agent"]
+
+    resumed_model = resume_qa(
+        workspace,
+        failed_model["thread_id"],
+        provider=ScriptedProvider(
+            [
+                _tool_call("call-after-model-failure", "wiki/papers/paper-1.md"),
+                _final(
+                    answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "论文记录了方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                ),
+            ]
+        ),
+    )
+    assert resumed_model["status"] == "completed"
+
+    real_read = read_project_file
+    monkeypatch.setattr(
+        "paperscout.qa.read_project_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("temporary read failure")),
+    )
+    failed_tool = run_qa(
+        workspace,
+        "方法？",
+        "session-tool-failure",
+        provider=ScriptedProvider([_tool_call("call-tool-failure", "wiki/papers/paper-1.md")]),
+    )
+    assert failed_tool["status"] == "interrupted"
+    assert failed_tool["retryable"] is True
+    assert failed_tool["next_nodes"] == ["read_project_file"]
+    monkeypatch.setattr("paperscout.qa.read_project_file", real_read)
+
+    resumed_tool = resume_qa(
+        workspace,
+        failed_tool["thread_id"],
+        provider=ScriptedProvider(
+            [
+                _final(
+                    answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "论文记录了方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                )
+            ]
+        ),
+    )
+    assert resumed_tool["status"] == "completed"
+    assert resumed_tool["read_budget"]["calls_used"] == 1
+
+
+def test_qa_resume_replays_durable_tool_result_without_second_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    call = AgentToolCall(
+        id="call-journal",
+        name="read_project_file",
+        arguments={"path": "wiki/papers/paper-1.md"},
+    )
+    interrupted = run_qa(
+        workspace,
+        "方法？",
+        "session-tool-journal",
+        provider=ScriptedProvider([json.dumps({"type": "tool_call", **call.model_dump(mode="json")})]),
+        interrupt_before=["read_project_file"],
+    )
+    outcome = read_project_file(workspace, call.arguments, ReadBudget())
+    audit = workspace / "runs" / interrupted["run_id"] / "tools" / "001"
+    audit.mkdir(parents=True)
+    (audit / "request.json").write_text(
+        json.dumps(call.model_dump(mode="json"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (audit / "result.json").write_text(
+        json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paperscout.qa.read_project_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("tool must not run twice")),
+    )
+    final_provider = ScriptedProvider(
+        [
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            )
+        ]
+    )
+
+    result = resume_qa(workspace, interrupted["thread_id"], provider=final_provider)
+
+    assert result["status"] == "completed"
+    assert result["read_budget"]["calls_used"] == 1
+
+
+def test_qa_resume_replays_durable_model_output_without_second_call(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    interrupted = run_qa(
+        workspace,
+        "方法？",
+        "session-model-journal",
+        provider=ScriptedProvider([]),
+        interrupt_before=["qa_agent"],
+    )
+    output_path = workspace / "runs" / interrupted["run_id"] / "qa-output-1.txt"
+    output_path.write_text(
+        _tool_call("call-from-journal", "wiki/papers/paper-1.md"),
+        encoding="utf-8",
+    )
+    final_provider = ScriptedProvider(
+        [
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            )
+        ]
+    )
+
+    result = resume_qa(workspace, interrupted["thread_id"], provider=final_provider)
+
+    assert result["status"] == "completed"
+    assert len(final_provider.requests) == 1
 
 
 def test_qa_answer_contract_rejects_unowned_cross_paper_evidence() -> None:

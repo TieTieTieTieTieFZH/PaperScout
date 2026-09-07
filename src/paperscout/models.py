@@ -396,6 +396,7 @@ class IngestGraphState(BaseModel):
     attempt: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)
     staging_path: str | None = None
+    staging_hashes: dict[str, str] = Field(default_factory=dict)
     published: bool = False
     last_error: str | None = None
     result: dict[str, Any] | None = None
@@ -417,6 +418,7 @@ class QAGraphState(BaseModel):
     session_id: str = Field(min_length=1)
     workspace: str = Field(min_length=1)
     question: str = Field(min_length=1)
+    llm_mode: Literal["mock", "real"] = "mock"
     status: RunStatus = RunStatus.PENDING
     current_node: str | None = None
     event_sequence: int = Field(default=0, ge=0)
@@ -446,6 +448,8 @@ class AgentKind(str, Enum):
 
 class EventKind(str, Enum):
     RUN_STARTED = "run.started"
+    RUN_INTERRUPTED = "run.interrupted"
+    RUN_RESUMED = "run.resumed"
     MODEL_STARTED = "model.started"
     MODEL_COMPLETED = "model.completed"
     TOOL_STARTED = "tool.started"

@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；Session、上下文压缩、Answer Review 和中断恢复仍在开发。
+- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具故障后续跑和宿主文件副作用幂等恢复。Session、上下文压缩和 Answer Review 仍在开发。
 - QA 只使用宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；模型只看到精简 JSON 外壳与自然语言正文，哈希和完整预算信息保留在宿主审计中。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
@@ -78,7 +78,7 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 
 ```python
 from pathlib import Path
-from paperscout import run_qa
+from paperscout import resume_qa, run_qa
 
 result = run_qa(
     workspace=Path("./paper-workspace"),
@@ -89,7 +89,24 @@ result = run_qa(
 print(result["answer"])
 ```
 
-QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、重复调用 ID 或未读 Evidence 引用会失败关闭。当前 `session_id` 用于运行关联，用户可读 Session 文件、跨轮记忆和中断后续跑尚未实现。`mock` 只验证确定性控制流；真实问答质量需要使用 `real` 单独人工评测。
+需要在指定节点前暂停时，可传入 `interrupt_before=["read_project_file"]`。返回结果的 `status` 为 `interrupted` 时，使用其中的 `thread_id` 恢复：
+
+```python
+paused = run_qa(
+    workspace=Path("./paper-workspace"),
+    question="这些论文的方法有什么共同点？",
+    session_id="research-session-1",
+    llm_mode="mock",
+    interrupt_before=["read_project_file"],
+)
+result = resume_qa(
+    workspace=Path("./paper-workspace"),
+    thread_id=paused["thread_id"],
+    llm_mode="mock",
+)
+```
+
+QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、重复调用 ID 或未读 Evidence 引用会失败关闭。当前 `session_id` 用于运行关联，用户可读 Session 文件和跨轮记忆尚未实现。`mock` 只验证确定性控制流；真实问答质量需要使用 `real` 单独人工评测。
 
 ### 使用本地 MinerU 结果
 
@@ -122,6 +139,8 @@ run_ingest_from_raw(
 ```
 
 如果同一 `paper_id` 已有 Wiki、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。候选先通过本地结构规则，再由独立、无工具、无 Session 的 Wiki Review 审核；`REVISE/REJECT` 最多驱动一次完整重生成，非法 verdict 或超过最大次数均失败关闭。每次语义审核的 request、response 和 result 保存在 `runs/{run_id}/review/wiki/{attempt}/`。最后还会对完整 staging Wiki 执行确定性审核，任一审核失败都不会向 `wiki/` 发布文件。
+
+Ingest 同样支持 `interrupt_before=["ingest_agent"]` 等节点前暂停，并使用 `resume_ingest(workspace, interrupted["thread_id"], llm_mode=...)` 恢复。已经持久化的模型、Review 和工具结果不会重复执行；发布使用 staging 清单识别和修复原子替换的中断窗口。若进程恰好在远程模型已返回但结果尚未写入运行审计之前崩溃，Provider 请求可能重发；是否具备计费级 exactly-once 取决于 Provider 是否支持幂等键。
 
 旧 Wiki 不提供兼容迁移；保留不可变 `raw/`，使用当前 Ingest 重新生成 Wiki。
 

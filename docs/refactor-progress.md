@@ -18,13 +18,13 @@
 
 | 项目 | 当前结果 | 实现是否已验证 | 验证方式 |
 | --- | --- | --- | --- |
-| 离线测试集 | 60 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q`；越界 reparse point 在普通 symlink 不可用时通过 Windows junction 回退实测 |
+| 离线测试集 | 75 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q`；越界 reparse point 在普通 symlink 不可用时通过 Windows junction 回退实测 |
 | 依赖锁一致性 | 通过 | 本地自动验证 | `uv --no-cache lock --check`（绕开本机全局 uv cache 路径冲突，不改变校验语义） |
 | 补丁空白/冲突标记 | 通过 | 本地自动验证 | `git diff --check` |
 | Windows GitHub Actions | 本次 main 推送后触发 | 未验证 | `.github/workflows/ci.yml`：`uv sync --frozen --group dev`，随后 `uv run pytest -q` |
 | 真实 MinerU/真实 LLM | 未纳入本轮 | 未验证 | `tests/manual_mineru_raw.py`、`tests/manual_raw_to_wiki.py`、`tests/evaluate_ingest_agent.py` |
 
-离线测试只证明表中已覆盖的控制流和契约；Mock Review 不能证明真实语义审核质量，也不证明尚未实现的 QA、Session、Answer Review 或中断恢复。
+离线测试只证明表中已覆盖的控制流和契约；Mock QA/Review 不能证明真实语义质量，也不证明尚未实现的 Session、上下文压缩或 Answer Review。
 
 ## 3. 阶段进度
 
@@ -35,13 +35,13 @@
 | P0-A Wiki 契约 | 已完成 | 固定五栏与顺序、每栏 1–3 个当前输入 Evidence、规范渲染与索引。 | 本地自动验证 | `tests/test_p0a_contracts.py`、`tests/test_ingest_from_raw.py` | 无。 |
 | P0-A Review 契约 | 已完成 | `ReviewVerdict`/`ReviewDecision` 严格模型和仅解析第一行的 fail-closed parser。 | 本地自动验证 | `tests/test_review_contract.py` | 无；真实语义质量属于人工评测，不影响契约完成状态。 |
 | P0-A Session/Graph State/Tool/Event 契约 | 仅契约 | 严格 Session、预算、Tool Call、Graph State、WorkflowEvent 模型。 | 本地自动验证 | `tests/test_p0a_contracts.py`、`tests/test_evidence_contract.py` | 执行层分别属于 P0-C、P0-D、P1。 |
-| P0-B Ingest Graph | 已完成 | 真实 `StateGraph`、无工具 Ingest、规则修复、独立 Wiki Review、`APPROVE/REVISE/REJECT` 条件循环、最大两次生成、两次 raw 保护、候选哈希复核、staging 审核、原子发布和统一失败终态。 | 本地自动验证 | `tests/test_ingest_from_raw.py`、`tests/test_review_contract.py` | 真实 LLM 语义质量未人工验证；中断后续跑属于 P0-D1，不作为 P0-B 完成声明。 |
+| P0-B Ingest Graph | 已完成 | 真实 `StateGraph`、无工具 Ingest、规则修复、独立 Wiki Review、`APPROVE/REVISE/REJECT` 条件循环、raw 保护、候选哈希复核、staging 审核、原子发布和统一失败终态。 | 本地自动验证 | `tests/test_ingest_from_raw.py`、`tests/test_review_contract.py` | 真实 LLM 语义质量未人工验证；中断续跑已在 P0-D1 完成。 |
 | P0-C1 受控只读工具 | 已完成 | `read_project_file` 支持文本/目录、PDF/图片资源、严格 Schema、允许根目录、路径穿越/reparse point 防护、offset/截断、哈希、资源记录和调用/字符预算。 | 本地自动验证 | `tests/test_read_project_file.py`：14 passed；Windows junction 回退验证越界链接 | 无；工具事件与 Graph State 更新已在 P0-C2 完成。 |
-| P0-C2 QA Agent Loop | 已完成 | 真实 QA `StateGraph`、严格单对象 JSON 动作、单工具条件循环、精简模型可见结果、完整宿主审计、错误纠正、预算耗尽处理、Wiki→Evidence→raw 渐进读取、结构化回答及论文/Evidence 归属校验。 | 本地自动验证 | `tests/test_qa_graph.py`：9 passed；覆盖 Mock 公开入口、四级渐进读取、错误修正、预算、跨论文与伪造引用 | 真实 LLM 问答质量未人工验证；Session、Answer Review 和中断后续跑分别属于后续阶段。 |
-| P0-D1 SQLite Checkpointer | 部分实现 | `GraphRuntime`、SQLite Saver、`thread_id` 配置；实际 Ingest 与 QA 各节点使用 Checkpointer，终态可跨 runtime reconstruction 读取。 | 本地自动验证 | `test_sqlite_checkpointer_survives_runtime_reconstruction`、Ingest 图/失败终态测试、`test_qa_graph_progressively_reads_wiki_evidence_and_raw` | 未实现并验证中断后续跑和副作用幂等。 |
+| P0-C2 QA Agent Loop | 已完成 | 真实 QA `StateGraph`、严格单对象 JSON 动作、单工具条件循环、精简模型可见结果、完整宿主审计、错误纠正、预算耗尽处理、Wiki→Evidence→raw 渐进读取、结构化回答及论文/Evidence 归属校验。 | 本地自动验证 | `tests/test_qa_graph.py`：13 passed；覆盖 Mock 公开入口、四级渐进读取、错误修正、预算、跨论文与伪造引用 | 真实 LLM 问答质量未人工验证；Session 与 Answer Review 分别属于后续阶段。 |
+| P0-D1 SQLite Checkpointer 与恢复 | 已完成 | Ingest/QA 显式节点前中断、瞬时模型/Review/工具故障保留可恢复 Checkpoint、`resume_ingest`/`resume_qa`、运行环境校验、终态幂等返回、模型/Review/工具持久化重放、原子审计写、staging 重建、发布清单校验与两个原子替换崩溃窗口恢复。 | 本地自动验证 | `tests/test_ingest_from_raw.py`：28 passed；`tests/test_qa_graph.py`：13 passed；覆盖 runtime reconstruction、原子文件替换、预算不重复计费、发布回滚和 raw 不变性 | 宿主文件副作用已幂等；若进程在远程模型返回但结果尚未持久化的极短窗口崩溃，Provider 请求可能重发，除非 Provider 支持幂等键。 |
 | P0-D2 Session、压缩与记忆 | 仅契约 | Session/消息/资源记录/预算/项目记忆模型。 | 本地自动验证（仅模型） | 严格模型测试 | 文件持久化、最近四轮、结构化摘要、旧工具文本移除、继续执行与恢复均未实现。 |
 | P0-E Answer Review | 未开始 | 只有通用 Review 契约。 | 未验证 | 无 | 答案规则、语义 Review、补读/修订/拒绝条件边。 |
-| P1 事件与可观测性 | 部分实现 | Ingest 与 QA 严格 JSONL 运行/模型/终态事件；QA 工具开始与完成事件。 | 本地自动验证 | Ingest 事件序列测试、`test_qa_graph_progressively_reads_wiki_evidence_and_raw` | Answer Review/Compaction 事件、流式消费和回放未实现。 |
+| P1 事件与可观测性 | 部分实现 | Ingest 与 QA 严格 JSONL 运行/模型/中断/恢复/终态事件；QA 工具开始与完成事件；恢复后序号连续。 | 本地自动验证 | Ingest/QA 恢复事件序列测试 | Answer Review/Compaction 事件、流式消费和回放未实现；节点重试事件语义当前为 at-least-once。 |
 | 旧核心逻辑清理 | 已完成 | 移除旧 Evidence、ReadRaw、QA、迁移和旧 `state.json` 路径；保留导入、MinerU、raw 和发布边界。 | 本地自动验证 | 全量 pytest；旧符号与路径静态检索 | 无；后续不新增兼容层。 |
 
 ## 4. 已完成切片与提交证据
@@ -58,13 +58,14 @@
 | 2026-09-07 | `606e1dd` | 将 raw→Wiki 主路径切换为真实 LangGraph `StateGraph`，接入 SQLite Checkpointer、显式失败分支、结构化覆盖报告和发布前二次完整性门。 | 26 个离线测试、依赖锁、补丁格式、图接线和过期架构声明检查通过。 |
 | 2026-09-07 | `27cf929` | 接入独立 Wiki Review Chat Client、严格 verdict parser、只提交实际引用 Evidence、Review 审计文件和 `REVISE/REJECT` 重生成循环。 | 37 个离线测试、依赖锁、逐文件架构登记、过期声明和补丁格式检查通过。 |
 | 2026-09-07 | `39f0a89` | 实现受控 `read_project_file` 的统一结果契约、路径安全、文件类型处理、文本截断、哈希、资源记录和读取预算。 | 完整基线 51 passed；符号链接不可用时通过 Windows junction 回退完成越界 reparse point 实测。 |
-| 2026-09-07 | （本提交） | 实现 P0-C2 QA Agent Loop，并将工具模型输出收敛为精简 JSON 外壳；宿主继续保留完整预算、哈希与审计结果。 | QA 专项 9 passed；完整离线基线 60 passed；依赖锁与补丁格式检查通过。 |
+| 2026-09-07 | `5ec709f` | 实现 P0-C2 QA Agent Loop，并将工具模型输出收敛为精简 JSON 外壳；宿主继续保留完整预算、哈希与审计结果。 | QA 专项 9 passed；完整离线基线 60 passed；依赖锁与补丁格式检查通过。 |
+| 2026-09-07 | （本提交） | 完成 P0-D1 Checkpoint 中断/瞬时故障续跑与宿主副作用幂等恢复。 | Ingest/QA 专项 41 passed；完整离线基线 75 passed；依赖锁与补丁格式检查通过。 |
 
 ## 5. 项目经历表述验收
 
 | 简历候选表述 | 当前是否可以写成“已实现” | 证据与原因 |
 | --- | --- | --- |
-| 自研领域 Agent Harness | 否 | Agent Loop、工具生命周期和 Checkpointer 已落地，但 Session、压缩和真实中断恢复尚未形成闭环。 |
+| 自研领域 Agent Harness | 否 | Agent Loop、工具生命周期、Checkpointer 和中断/瞬时故障恢复已落地，但 Session 与上下文压缩尚未形成闭环。 |
 | 基于 LangGraph 编排 Ingest、QA、Review | 否 | Ingest、QA 与 Wiki Review 已由 LangGraph 编排，但 Answer Review 尚未实现，仍不能扩大表述为完整多 Agent 编排。 |
 | Wiki 到 PDF 原文的 Evidence 映射 | 可以，限定为 MinerU section evidence | 稳定 ID、原始 block index、页码与 bbox 已实现并有自动测试。 |
 | 渐进式加载 Wiki | 可以，限定为受控只读 QA | QA Agent Loop 已自动验证入口→论文 Wiki→section Evidence→raw 的模型决策与工具回填链路；真实模型的资料选择质量尚未人工评测。 |
@@ -73,4 +74,4 @@
 
 ## 6. 下一步
 
-下一最小切片是 P0-D1 的中断后续跑与副作用幂等：先固定 Ingest/QA 在模型或工具节点中断后的恢复测试，再增加明确恢复入口。Session 文件、最近四轮与上下文压缩属于 P0-D2，不与恢复切片混做。
+下一最小切片是 P0-D2 的用户可读 Session 文件：先固定 `messages.jsonl`、`state.json`、`summary.md` 的原子写入、同一 Session 多轮继续和工具大文本不进入长期状态，再实现最近四轮与压缩策略。

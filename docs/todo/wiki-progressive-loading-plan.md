@@ -257,3 +257,11 @@ Review Agent 执行语义审核
 | Review Agent | 在写入前检查候选内容是否受到 evidence 支持 |
 | QA Agent | 渐进式读取 Wiki，并根据需要加载完整 section evidence 回答用户问题 |
 
+## 9. Checkpoint 与恢复
+
+Ingest Graph 可以在显式节点边界暂停，并返回 `run_id`、`thread_id` 和下一节点。宿主使用 `resume_ingest()` 从 SQLite Checkpoint 继续，不重新导入或修改 raw。
+
+模型候选与 Wiki Review 结果通过原子文件替换写入运行目录，再推进 Graph State；恢复时请求与持久化结果一致则直接重放。`render_wiki` 只重建当前运行的 staging。发布前保存完整 staging 文件哈希清单，用于识别“旧 Wiki 已移到 backup”和“新 Wiki 已发布但 Checkpoint 尚未更新”两个中断窗口；内容与清单不一致时回滚并失败关闭。
+
+宿主文件副作用按上述方式幂等。远程模型请求在响应尚未持久化的在途窗口仍是 at-least-once；没有 Provider 幂等键时不承诺计费级 exactly-once。
+
