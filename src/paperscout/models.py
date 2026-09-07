@@ -124,6 +124,54 @@ class ReadProjectFileArguments(BaseModel):
     max_chars: int = Field(default=20_000, ge=1, le=50_000)
 
 
+class ProjectFileEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    kind: Literal["directory", "text", "pdf", "image", "unsupported"]
+
+
+class ReadProjectFileResult(BaseModel):
+    """JSON-safe result returned to the QA Agent for every read attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["success", "error"]
+    path: str
+    kind: Literal["directory", "text", "pdf", "image"] | None = None
+    content: str | None = None
+    entries: list[ProjectFileEntry] = Field(default_factory=list)
+    offset_chars: int = Field(default=0, ge=0)
+    next_offset_chars: int | None = Field(default=None, ge=0)
+    returned_chars: int = Field(default=0, ge=0)
+    truncated: bool = False
+    sha256: str | None = None
+    media_type: str | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def validate_result_shape(self) -> "ReadProjectFileResult":
+        if self.status == "success":
+            if self.kind is None or self.sha256 is None or self.error_code is not None or self.error is not None:
+                raise ValueError("successful reads require kind and sha256 without error fields")
+            if self.kind in {"text", "directory"} and self.content is None:
+                raise ValueError("text and directory reads require content")
+            if self.kind in {"pdf", "image"} and self.content is not None:
+                raise ValueError("binary resources must not expose content")
+        elif self.error_code is None or self.error is None:
+            raise ValueError("failed reads require error_code and error")
+        return self
+
+
+class ReadProjectFileOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    result: ReadProjectFileResult
+    budget: "ReadBudget"
+    record: "ReadResourceRecord | None" = None
+
+
 class WikiSectionKind(str, Enum):
     RESEARCH_QUESTION = "research_question"
     CORE_IDEA = "core_idea"

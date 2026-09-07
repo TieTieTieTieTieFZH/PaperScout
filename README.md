@@ -6,6 +6,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
 - 当前 Wiki Ingest 已由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer，包含确定性规则与独立 Wiki Review Chat Client；Retrieval QA、Session、Answer Review 和中断恢复仍在开发。
+- 已实现 QA 将使用的宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；目前尚未接入 QA Agent Loop。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。

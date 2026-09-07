@@ -114,7 +114,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 ### 4.5 Session 与读取工具
 
-`SessionState`、`SessionMessage`、`ProjectMemory`、`ReadBudget`、`ReadResourceRecord`、`AgentToolCall` 与 `ReadProjectFileArguments` 已定义。它们目前只是契约：尚未实现 `messages.jsonl`、Session `state.json`、`summary.md`、压缩策略或真正的 `read_project_file` 工具。
+`read_project_file` 已实现为宿主控制的纯只读工具：参数先经严格 Pydantic Schema 校验，路径必须是项目相对路径且只能解析到 `wiki/` 或 `raw/papers/`，拒绝绝对路径、`..`、越界路径和越界符号链接。文本与目录按字符预算返回并支持 offset，PDF/图片只返回路径、媒体类型和哈希，不返回二进制；有效调用和返回字符分别计入 `ReadBudget`。`SessionState`、`SessionMessage`、`ProjectMemory` 与 `AgentToolCall` 仍只是契约，尚未实现 Session 文件、压缩策略或 QA Agent Loop。
 
 ### 4.6 事件
 
@@ -151,6 +151,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `src/paperscout/prompts.py` | 定义 Ingest、规则修复、Review 驱动重生成和 Wiki Review 的系统/用户提示。 | Ingest 与 Wiki Review 均无工具、无 Session；尚无 QA/Answer Review prompt。 |
 | `src/paperscout/llm.py` | LLM 适配层：从环境读取设置、确定性 `MockLLM`、OpenAI-compatible Responses 客户端。 | Ingest 与 Review 使用独立实例；旧 QA 特定方法已删除。 |
 | `src/paperscout/review.py` | 严格解析 Review 第一行状态，并把自然语言意见转换为 `ReviewDecision`。 | Wiki Review 已接入；Answer Review 后续复用同一机制。 |
+| `src/paperscout/read_tool.py` | 实现 QA 唯一宿主只读工具：Schema、允许根目录、路径穿越/符号链接防护、文件类型、文本截断、资源哈希和读取预算。 | 已独立实现并自动测试；越界 Windows reparse point 已通过 junction 回退实测，尚未接入 QA Graph。 |
 | `src/paperscout/wiki.py` | 渲染模型输入、解析/校验五栏候选、生成论文 Wiki、读写 section evidence、更新规范索引。 | 不含旧 chunks/claims/concepts 或迁移兼容逻辑。 |
 | `src/paperscout/health.py` | 对 staging Wiki 执行确定性结构/引用规则并生成健康报告。 | 不是语义 Review Agent。 |
 | `src/paperscout/storage.py` | 文件系统路径、JSON/哈希、严格事件追加、staging 准备、带回滚的原子发布、结果写入和安全复制。 | Checkpoint 不存于此；旧自定义运行状态文件已删除。 |
@@ -165,6 +166,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `tests/test_p0a_contracts.py` | 验证 Wiki/Session/Graph/Event 契约，以及 SQLite Checkpoint 跨运行时恢复。 | 是。 |
 | `tests/test_ingest_from_raw.py` | 验证 raw→Wiki 闭环、固定五栏、Evidence 产物、事件、一次修复、真实图节点、SQLite 终态、结构化覆盖报告及各种失败不发布。 | 是。 |
 | `tests/test_review_contract.py` | 验证严格 verdict 第一行解析及未知、缺失或错位状态全部失败关闭。 | 是。 |
+| `tests/test_read_project_file.py` | 验证文本/目录读取、offset/截断、预算、路径范围、资源元数据、Schema 和结构化错误；符号链接不可用时以 Windows junction 实测越界 reparse point。 | 是。 |
 | `tests/fixtures/mineru_micro/content_list.json` | 最小确定性 MinerU fixture，覆盖二级章节和 Evidence 构造。 | 被自动测试读取。 |
 | `tests/manual_raw_to_wiki.py` | 使用本机已有 raw 手动运行真实或 Mock Ingest。 | 否，需人工调用。 |
 | `tests/manual_mineru_raw.py` | 手动调用 MinerU API，把本地 PDF 解析并导入 raw。 | 否；含本机示例路径，需按环境修改。 |
@@ -197,12 +199,11 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 当前最大架构缺口不是数据模型，而是“模型已经定义、执行图尚未接线”：
 
-1. 实现受控的 `read_project_file`，覆盖路径权限、符号链接、单次与累计预算；
-2. 建立 QA Agent Loop 和 Wiki→Evidence→raw 渐进读取；
-3. 为 Ingest/QA 增加明确的中断后续跑入口和幂等副作用策略；
-4. 接入 Session 文件、上下文压缩和长期项目记忆；
-5. 增加 Answer Review；
-6. 补齐完整事件流、回放和真实模型评测。
+1. 建立 QA Agent Loop 和 Wiki→Evidence→raw 渐进读取；
+2. 为 Ingest/QA 增加明确的中断后续跑入口和幂等副作用策略；
+3. 接入 Session 文件、上下文压缩和长期项目记忆；
+4. 增加 Answer Review；
+5. 补齐完整事件流、回放和真实模型评测。
 
 每一步都应先添加 fixture 和关键契约测试，再实现功能，并在同一提交中更新 `docs/refactor-progress.md`。
 

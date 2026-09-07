@@ -18,7 +18,7 @@
 
 | 项目 | 当前结果 | 实现是否已验证 | 验证方式 |
 | --- | --- | --- | --- |
-| 离线测试集 | 37 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q` |
+| 离线测试集 | 51 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q`；越界 reparse point 在普通 symlink 不可用时通过 Windows junction 回退实测 |
 | 依赖锁一致性 | 通过 | 本地自动验证 | `uv --no-cache lock --check`（绕开本机全局 uv cache 路径冲突，不改变校验语义） |
 | 补丁空白/冲突标记 | 通过 | 本地自动验证 | `git diff --check` |
 | Windows GitHub Actions | 本次 main 推送后触发 | 未验证 | `.github/workflows/ci.yml`：`uv sync --frozen --group dev`，随后 `uv run pytest -q` |
@@ -36,7 +36,8 @@
 | P0-A Review 契约 | 已完成 | `ReviewVerdict`/`ReviewDecision` 严格模型和仅解析第一行的 fail-closed parser。 | 本地自动验证 | `tests/test_review_contract.py` | 无；真实语义质量属于人工评测，不影响契约完成状态。 |
 | P0-A Session/Graph State/Tool/Event 契约 | 仅契约 | 严格 Session、预算、Tool Call、Graph State、WorkflowEvent 模型。 | 本地自动验证 | `tests/test_p0a_contracts.py`、`tests/test_evidence_contract.py` | 执行层分别属于 P0-C、P0-D、P1。 |
 | P0-B Ingest Graph | 已完成 | 真实 `StateGraph`、无工具 Ingest、规则修复、独立 Wiki Review、`APPROVE/REVISE/REJECT` 条件循环、最大两次生成、两次 raw 保护、候选哈希复核、staging 审核、原子发布和统一失败终态。 | 本地自动验证 | `tests/test_ingest_from_raw.py`、`tests/test_review_contract.py` | 真实 LLM 语义质量未人工验证；中断后续跑属于 P0-D1，不作为 P0-B 完成声明。 |
-| P0-C QA Graph 与只读工具 | 未开始 | 仅保留状态、参数和预算契约。 | 未验证 | 无可运行 QA 功能 | 实现工具权限/预算、Agent Loop、渐进读取、多论文引用校验。 |
+| P0-C1 受控只读工具 | 已完成 | `read_project_file` 支持文本/目录、PDF/图片资源、严格 Schema、允许根目录、路径穿越/reparse point 防护、offset/截断、哈希、资源记录和调用/字符预算。 | 本地自动验证 | `tests/test_read_project_file.py`：14 passed；Windows junction 回退验证越界链接 | 无；工具事件与 Graph State 更新属于 P0-C2。 |
+| P0-C2 QA Agent Loop | 未开始 | 只有 `QAGraphState`、Tool Call 和消息契约。 | 未验证 | 无可运行 QA 功能 | 模型/工具条件循环、渐进读取、结构化回答和多论文引用校验。 |
 | P0-D1 SQLite Checkpointer | 部分实现 | `GraphRuntime`、SQLite Saver、`thread_id` 配置；实际 Ingest 各节点使用 Checkpointer，成功和失败终态可跨 runtime reconstruction 读取。 | 本地自动验证 | `test_sqlite_checkpointer_survives_runtime_reconstruction`、`test_ingest_runs_as_checkpointed_state_graph`、失败终态测试 | QA 尚未接入；未实现并验证中断后续跑和副作用幂等。 |
 | P0-D2 Session、压缩与记忆 | 仅契约 | Session/消息/资源记录/预算/项目记忆模型。 | 本地自动验证（仅模型） | 严格模型测试 | 文件持久化、最近四轮、结构化摘要、旧工具文本移除、继续执行与恢复均未实现。 |
 | P0-E Answer Review | 未开始 | 只有通用 Review 契约。 | 未验证 | 无 | 答案规则、语义 Review、补读/修订/拒绝条件边。 |
@@ -56,13 +57,14 @@
 | 2026-09-07 | `2fdb03c` | 新增根目录 `AGENTS.md`，固化文档阅读顺序、开发边界、提问条件和验证/推送规则。 | 22 个离线测试、依赖锁、文档引用和补丁格式检查通过。 |
 | 2026-09-07 | `606e1dd` | 将 raw→Wiki 主路径切换为真实 LangGraph `StateGraph`，接入 SQLite Checkpointer、显式失败分支、结构化覆盖报告和发布前二次完整性门。 | 26 个离线测试、依赖锁、补丁格式、图接线和过期架构声明检查通过。 |
 | 2026-09-07 | `27cf929` | 接入独立 Wiki Review Chat Client、严格 verdict parser、只提交实际引用 Evidence、Review 审计文件和 `REVISE/REJECT` 重生成循环。 | 37 个离线测试、依赖锁、逐文件架构登记、过期声明和补丁格式检查通过。 |
+| 2026-09-07 | 本次只读工具提交 | 实现受控 `read_project_file` 的统一结果契约、路径安全、文件类型处理、文本截断、哈希、资源记录和读取预算。 | 完整基线 51 passed；符号链接不可用时通过 Windows junction 回退完成越界 reparse point 实测。 |
 
 ## 5. 项目经历表述验收
 
 | 简历候选表述 | 当前是否可以写成“已实现” | 证据与原因 |
 | --- | --- | --- |
 | 自研领域 Agent Harness | 否 | 只有严格契约和 Checkpointer 骨架；Agent Loop、工具生命周期、Session、压缩和真实恢复未形成闭环。 |
-| 基于 LangGraph 编排 Ingest、QA、Review | 否 | Ingest 已由 LangGraph 编排，但 QA Graph 和语义 Review 节点尚未实现，不能扩大表述为完整多 Agent 编排。 |
+| 基于 LangGraph 编排 Ingest、QA、Review | 否 | Ingest 与 Wiki Review 已由 LangGraph 编排，但 QA Graph 和 Answer Review 尚未实现，不能扩大表述为完整多 Agent 编排。 |
 | Wiki 到 PDF 原文的 Evidence 映射 | 可以，限定为 MinerU section evidence | 稳定 ID、原始 block index、页码与 bbox 已实现并有自动测试。 |
 | 渐进式加载 Wiki | 否 | 尚无可运行 QA 工具和入口→正文→Evidence→raw 的 Agent Loop。 |
 | 规则校验 + Review Agent 双阶段审核 | 只能限定为 Wiki Ingest | Wiki 的确定性规则与语义 Review 已接入；Answer Review 尚未实现，因此不能描述为全系统双审核。 |
@@ -70,4 +72,4 @@
 
 ## 6. 下一步
 
-下一最小切片是 P0-C 的受控 `read_project_file`：先为参数 Schema、允许目录、路径穿越、符号链接、单次截断和单轮累计预算添加测试，再实现宿主只读工具。随后把工具接入 QA Agent Loop；中断后续跑与副作用幂等仍属于 P0-D1 的未完成项。
+下一最小切片是 P0-C2 的 QA Agent Loop：先固定模型请求 Tool Call、宿主执行、预算耗尽、工具错误修正和最终结构化回答的条件图测试，再接入 `read_project_file`。中断后续跑与副作用幂等仍属于 P0-D1。

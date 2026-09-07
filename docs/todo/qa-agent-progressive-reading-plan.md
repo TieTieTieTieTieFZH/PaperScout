@@ -177,6 +177,10 @@ JSON Schema：
 }
 ```
 
+当前统一工具结果还包含 `kind`、`returned_chars`、`media_type`、结构化目录 `entries`，以及失败时的 `error_code` 和 `error`。文本与目录的 `content` 可按 `offset_chars` 和预算截断；为避免绕过预算，目录内容发生截断时不返回完整 `entries`。PDF 和图片只返回资源路径、类型与 SHA256，`content` 始终为空。
+
+调用预算规则：未通过 JSON Schema 的参数不进入有效工具调用，也不消耗预算；通过 Schema 后的调用会消耗一次调用额度，即使随后因路径或文件类型失败。成功返回的文本字符计入累计字符预算；剩余额度小于请求长度时只返回剩余预算内的内容并标记 `truncated: true`。
+
 ### 4.3 宿主校验
 
 JSON Schema 校验后，宿主继续检查：
