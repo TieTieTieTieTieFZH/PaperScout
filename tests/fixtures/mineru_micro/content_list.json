@@ -1,0 +1,15 @@
+[
+  {"type": "title", "page_idx": 0, "text": "A Test Paper", "text_level": 1},
+  {"type": "header", "page_idx": 0, "text": "Journal header"},
+  {"type": "text", "page_idx": 0, "text": "Abstract", "text_level": 2, "bbox": [10, 20, 200, 40]},
+  {"type": "text", "page_idx": 0, "text": "We study a testable research problem.", "bbox": [10, 50, 500, 90]},
+  {"type": "equation", "page_idx": 0, "equation": "y = f(x)", "bbox": [10, 100, 300, 140]},
+  {"type": "text", "page_idx": 1, "text": "2.1 Architecture", "text_level": 3},
+  {"type": "table", "page_idx": 1, "table_caption": ["Table 1. Results"], "table_body": "A | B", "bbox": [20, 100, 500, 400]},
+  {"type": "text", "page_idx": 2, "text": "2 Method", "text_level": 2},
+  {"type": "text", "page_idx": 2, "text": "The method has two stages.", "id": "block-method"},
+  {"type": "page_number", "page_idx": 2, "text": "3"},
+  {"type": "image", "page_idx": 3, "image_caption": ["Figure 1. Method overview"], "bbox": [30, 80, 550, 600]},
+  {"type": "text", "page_idx": 4, "text": "References", "text_level": 2},
+  {"type": "text", "page_idx": 4, "text": "Example reference."}
+]
