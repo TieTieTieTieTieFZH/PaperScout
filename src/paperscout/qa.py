@@ -32,7 +32,7 @@ from .session import (
     merge_project_memory,
     merge_read_resources,
     persist_session,
-    recent_session_messages,
+    invalidate_stale_session_resources,
 )
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
 
@@ -108,6 +108,7 @@ def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
             "content": build_qa_context_prompt(
                 history_summary=state.history_summary,
                 memory=state.memory.model_dump(mode="json"),
+                invalidated_resources=state.invalidated_resources,
             ),
         },
     ]
@@ -127,7 +128,11 @@ def _new_state(
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
     session, history = load_session(store.workspace, session_id)
-    recent_history = recent_session_messages(history)
+    session, recent_history, invalidated_resources = invalidate_stale_session_resources(
+        store.workspace,
+        session,
+        history,
+    )
     run_id = uuid.uuid4().hex
     state = QAGraphState(
         run_id=run_id,
@@ -141,11 +146,20 @@ def _new_state(
         history_summary=session.summary,
         memory=session.memory,
         session_read_resources=session.read_resources,
+        invalidated_resources=invalidated_resources,
         session_message_count=len(history),
         read_budget=read_budget or ReadBudget(),
         turn_start_message_index=len(recent_history),
     )
-    _event(store, state, EventKind.RUN_STARTED, "qa", "QA run started", agent=AgentKind.QA)
+    _event(
+        store,
+        state,
+        EventKind.RUN_STARTED,
+        "qa",
+        "QA run started",
+        {"invalidated_resources": invalidated_resources},
+        agent=AgentKind.QA,
+    )
     return state
 
 

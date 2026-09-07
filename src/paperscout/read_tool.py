@@ -101,6 +101,17 @@ def _directory_content(directory: Path, workspace: Path) -> tuple[str, list[Proj
     return "\n".join(names), entries
 
 
+def project_resource_sha256(workspace: Path, relative_path: str) -> str | None:
+    """Return the current digest for a previously valid QA resource, or None if absent."""
+    resolved, _, _ = _resolve_allowed_path(workspace, relative_path)
+    if resolved is None:
+        return None
+    if _kind(resolved) == "directory":
+        content, _ = _directory_content(resolved, workspace.resolve())
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return sha256_file(resolved)
+
+
 def model_visible_read_result(outcome: ReadProjectFileOutcome) -> dict[str, Any]:
     """Return the small deterministic envelope shown to the QA model."""
     result = outcome.result

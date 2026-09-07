@@ -872,3 +872,169 @@ def test_session_context_keeps_four_turns_and_compacts_old_tool_text(
         .splitlines()
     ]
     assert [event.event_type for event in events].count(EventKind.CONTEXT_COMPACTED) == 1
+
+
+def test_changed_session_resource_is_invalidated_and_must_be_read_again(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    paper_path = workspace / "wiki" / "papers" / "paper-1.md"
+    old_tool_text = "OLD_RESOURCE_BODY_MUST_NOT_BE_REUSED"
+    paper_path.write_text(
+        paper_path.read_text(encoding="utf-8") + f"\n{old_tool_text}\n",
+        encoding="utf-8",
+    )
+    first = run_qa(
+        workspace,
+        "先读取论文。",
+        "session-stale-resource",
+        provider=ScriptedProvider(
+            [
+                _tool_call("first-read", "wiki/papers/paper-1.md"),
+                _final(
+                    answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "论文记录了方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                ),
+            ]
+        ),
+    )
+    old_hash = first["read_resources"][0]["sha256"]
+    new_tool_text = "NEW_RESOURCE_BODY_AFTER_REBUILD"
+    paper_path.write_text(
+        "# Test Paper\n\n## 方法\n\n更新后的方法。\n\n"
+        f"[evidence:paper-1:s0001]\n\n{new_tool_text}\n",
+        encoding="utf-8",
+    )
+    second_provider = ScriptedProvider(
+        [
+            _tool_call("second-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="更新后的 Wiki 仍记录该方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "更新后的 Wiki 仍记录该方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    second = run_qa(
+        workspace,
+        "文件更新后再核对。",
+        "session-stale-resource",
+        provider=second_provider,
+    )
+
+    assert second["status"] == "completed"
+    initial_request = second_provider.requests[0]
+    assert old_tool_text not in json.dumps(initial_request, ensure_ascii=False)
+    assert "wiki/papers/paper-1.md" in initial_request[1]["content"]
+    assert "必须重新读取" in initial_request[1]["content"]
+    assert '"evidence_ids": []' in initial_request[1]["content"]
+    historical_tools = [
+        message for message in initial_request[2:] if message["role"] == "tool"
+    ]
+    assert historical_tools == [
+        {
+            "role": "tool",
+            "content": {
+                "ok": False,
+                "error": {
+                    "code": "STALE_SESSION_RESOURCE",
+                    "message": "wiki/papers/paper-1.md changed or is unavailable; read it again",
+                },
+            },
+            "tool_call_id": "first-read",
+        }
+    ]
+    session_dir = workspace / "memory" / "sessions" / "session-stale-resource"
+    state = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert len(state.read_resources) == 1
+    assert state.read_resources[0].sha256 != old_hash
+    assert state.memory.evidence_ids == ["paper-1:s0001"]
+    message_log = (session_dir / "messages.jsonl").read_text(encoding="utf-8")
+    assert old_tool_text in message_log
+    assert new_tool_text in message_log
+
+
+def test_stale_resource_keeps_evidence_memory_backed_by_an_unchanged_resource(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    first = run_qa(
+        workspace,
+        "读取 Wiki 和原文证据。",
+        "session-partial-stale",
+        provider=ScriptedProvider(
+            [
+                _tool_call("wiki-read", "wiki/papers/paper-1.md"),
+                _tool_call("evidence-read", "wiki/evidence/paper-1/s0001.md"),
+                _final(
+                    answer="两份资料均指向该方法。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": "两份资料均指向该方法。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                ),
+            ]
+        ),
+    )
+    assert first["status"] == "completed"
+    (workspace / "wiki" / "papers" / "paper-1.md").write_text(
+        "# Rebuilt Wiki\n\n[evidence:paper-1:s0001]\n",
+        encoding="utf-8",
+    )
+    provider = ScriptedProvider(
+        [
+            _final(
+                answer="本轮未重新读取，不能返回论文事实。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+
+    second = run_qa(
+        workspace,
+        "哪些已读资源仍有效？",
+        "session-partial-stale",
+        provider=provider,
+    )
+
+    assert second["status"] == "completed"
+    context_prompt = provider.requests[0][1]["content"]
+    assert '"evidence_ids": ["paper-1:s0001"]' in context_prompt
+    historical_tools = [
+        message for message in provider.requests[0][2:] if message["role"] == "tool"
+    ]
+    assert historical_tools[0]["content"]["error"]["code"] == "STALE_SESSION_RESOURCE"
+    assert historical_tools[1]["content"]["path"] == "wiki/evidence/paper-1/s0001.md"
+    session_dir = workspace / "memory" / "sessions" / "session-partial-stale"
+    state = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert [record.path for record in state.read_resources] == [
+        "wiki/evidence/paper-1/s0001.md"
+    ]
+    assert state.memory.evidence_ids == ["paper-1:s0001"]

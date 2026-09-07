@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from .models import ProjectMemory, ReadResourceRecord, SessionMessage, SessionState
+from .read_tool import project_resource_sha256
 from .storage import read_json, write_json, write_text_atomic
 
 
@@ -101,6 +102,78 @@ def recent_session_messages(
 ) -> list[SessionMessage]:
     turns = session_turns(messages)
     return [message for turn in turns[-keep_turns:] for message in turn]
+
+
+def invalidate_stale_session_resources(
+    workspace: Path,
+    state: SessionState,
+    messages: list[SessionMessage],
+) -> tuple[SessionState, list[SessionMessage], list[str]]:
+    valid_resources: list[ReadResourceRecord] = []
+    stale_resources: list[ReadResourceRecord] = []
+    for record in state.read_resources:
+        current_sha256 = project_resource_sha256(workspace, record.path)
+        if current_sha256 == record.sha256:
+            valid_resources.append(record)
+        else:
+            stale_resources.append(record)
+    if not stale_resources:
+        return state, recent_session_messages(messages), []
+
+    valid_evidence = {
+        evidence_id
+        for record in valid_resources
+        for evidence_id in record.evidence_ids
+    }
+    stale_evidence = {
+        evidence_id
+        for record in stale_resources
+        for evidence_id in record.evidence_ids
+    }
+    invalid_evidence = stale_evidence - valid_evidence
+    memory = state.memory.model_copy(
+        update={
+            "evidence_ids": [
+                evidence_id
+                for evidence_id in state.memory.evidence_ids
+                if evidence_id not in invalid_evidence
+            ]
+        }
+    )
+    refreshed = state.model_copy(
+        update={
+            "memory": memory,
+            "read_resources": valid_resources,
+            "summary": build_session_summary(
+                messages,
+                memory=memory,
+                read_resources=valid_resources,
+            ),
+        }
+    )
+    stale_paths = list(dict.fromkeys(record.path for record in stale_resources))
+    context_messages: list[SessionMessage] = []
+    for message in recent_session_messages(messages):
+        content = message.content
+        if (
+            message.role == "tool"
+            and isinstance(content, dict)
+            and content.get("path") in stale_paths
+        ):
+            path = str(content["path"])
+            message = message.model_copy(
+                update={
+                    "content": {
+                        "ok": False,
+                        "error": {
+                            "code": "STALE_SESSION_RESOURCE",
+                            "message": f"{path} changed or is unavailable; read it again",
+                        },
+                    }
+                }
+            )
+        context_messages.append(message)
+    return refreshed, context_messages, stale_paths
 
 
 def _compact_text(value: str, limit: int = MAX_SUMMARY_MESSAGE_CHARS) -> str:
