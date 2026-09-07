@@ -9,7 +9,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
-- 先检索论文 summaries，再加载其中显式关联的 JSONL evidence，暂不依赖数据库或向量数据库。
+- 以论文 Wiki 入口和逐章节 Evidence 建立可追溯资料层，暂不依赖数据库或向量数据库。
 - 测试默认使用确定性的 Mock LLM。
 - 提供 OpenAI 兼容 Responses 接口适配器，但当前测试不会调用真实 LLM。
 - 暂无命令行接口，Python API 是当前主要集成入口。
@@ -75,7 +75,7 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 
 ```python
 from pathlib import Path
-from paperscout.workflow import run_ingest, run_qa
+from paperscout.workflow import run_ingest
 
 workspace = Path("./paper-workspace")
 run_ingest(
@@ -86,11 +86,6 @@ run_ingest(
     llm_mode="mock",
 )
 
-answer = run_qa(
-    workspace=workspace,
-    question="论文的主要贡献是什么？",
-    llm_mode="mock",
-)
 ```
 
 ### 从已存在 raw 生成 Wiki
@@ -108,7 +103,7 @@ run_ingest_from_raw(
 
 如果同一 `paper_id` 已有 Wiki、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。发布时会对完整 staging Wiki 执行本地规则审核，审核失败不会向 `wiki/` 发布任何文件。
 
-升级已有 Wiki 时，执行一次 `migrate_wiki(workspace)`；它会在 staging 中移除旧的概念与 chunks 产物，再通过健康检查后原子发布。
+旧 Wiki 不提供兼容迁移；保留不可变 `raw/`，使用当前 Ingest 重新生成 Wiki。
 
 ### 自动调用 MinerU 精准解析
 

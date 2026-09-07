@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .models import Artifact, RunEvent
+from .models import WorkflowEvent
 
 
 def llmwiki_workspace(project_root: Path) -> Path:
@@ -62,22 +62,11 @@ class FileSystemStore:
     def staging_wiki_dir(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "staging" / "wiki"
 
-    def append_event(self, run_id: str, event: RunEvent) -> None:
-        path = self.run_dir(run_id) / "events.jsonl"
+    def append_event(self, event: WorkflowEvent) -> None:
+        path = self.run_dir(event.run_id) / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(event.model_dump_json() + "\n")
-
-    def checkpoint(self, run_id: str, state: dict[str, Any]) -> None:
-        write_json(self.run_dir(run_id) / "state.json", state)
-
-    def register_artifact(self, run_id: str, artifact_type: str, path: Path) -> Artifact:
-        artifact = Artifact(artifact_type=artifact_type, path=str(path), sha256=sha256_file(path))
-        artifacts_path = self.run_dir(run_id) / "artifacts.json"
-        current = read_json(artifacts_path) if artifacts_path.exists() else []
-        current.append(artifact.model_dump(mode="json"))
-        write_json(artifacts_path, current)
-        return artifact
 
     def publish_staged_wiki(self, run_id: str) -> None:
         """Replace the complete Wiki snapshot, never copy individual live files."""

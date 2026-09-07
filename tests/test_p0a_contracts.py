@@ -58,7 +58,11 @@ def test_session_and_graph_states_are_strict_contracts(tmp_path: Path) -> None:
     session = SessionState(session_id="session-1")
     assert session.memory.evidence_ids == []
     ingest = IngestGraphState(
-        run_id="run-1", thread_id="ingest:run-1", workspace=str(tmp_path), paper_id="paper-1"
+        run_id="run-1",
+        thread_id="ingest:run-1",
+        workspace=str(tmp_path),
+        paper_id="paper-1",
+        llm_mode="mock",
     )
     qa = QAGraphState(
         run_id="run-2",

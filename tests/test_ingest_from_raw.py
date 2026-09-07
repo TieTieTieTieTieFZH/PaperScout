@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from paperscout.workflow import migrate_wiki, run_ingest_from_raw, run_qa
-from paperscout.wiki import retrieve
+from paperscout.models import EventKind, WorkflowEvent
+from paperscout.workflow import run_ingest_from_raw
 
 
 PAPER_ID = "2409.18839v1"
@@ -84,6 +84,15 @@ def test_raw_to_wiki_renders_five_sections_and_preserves_raw(tmp_path: Path) -> 
     assert not (tmp_path / "wiki" / "concepts").exists()
     assert not (tmp_path / "wiki" / "indexes" / "concepts.json").exists()
     assert not (tmp_path / "wiki" / "indexes" / "chunks.jsonl").exists()
+    run_dir = tmp_path / "runs" / result["run_id"]
+    events = [
+        WorkflowEvent.model_validate_json(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event.sequence for event in events] == list(range(len(events)))
+    assert events[0].event_type == EventKind.RUN_STARTED
+    assert events[-1].event_type == EventKind.RUN_COMPLETED
+    assert not (run_dir / "state.json").exists()
 
 
 def test_agent_receives_inline_citable_document(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,46 +166,3 @@ def test_raw_change_after_generation_prevents_publish(tmp_path: Path, monkeypatc
     monkeypatch.setattr("paperscout.workflow._provider", lambda mode: provider)
     assert run_ingest_from_raw(tmp_path, PAPER_ID)["status"] == "failed"
     assert not (tmp_path / "wiki").exists()
-
-
-def test_staging_migrates_legacy_artifacts(tmp_path: Path) -> None:
-    _raw_tree(tmp_path)
-    legacy = tmp_path / "wiki"
-    (legacy / "concepts").mkdir(parents=True)
-    (legacy / "concepts" / "old.md").write_text("旧概念", encoding="utf-8")
-    (legacy / "indexes").mkdir()
-    (legacy / "indexes" / "concepts.json").write_text("[]", encoding="utf-8")
-    (legacy / "indexes" / "chunks.jsonl").write_text("{}\n", encoding="utf-8")
-    assert run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")["status"] == "published"
-    assert not (tmp_path / "wiki" / "concepts").exists()
-    assert not (tmp_path / "wiki" / "indexes" / "concepts.json").exists()
-    assert not (tmp_path / "wiki" / "indexes" / "chunks.jsonl").exists()
-
-
-def test_explicit_migration_cleans_published_legacy_wiki(tmp_path: Path) -> None:
-    _raw_tree(tmp_path)
-    assert run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")["status"] == "published"
-    wiki = tmp_path / "wiki"
-    (wiki / "concepts").mkdir()
-    (wiki / "concepts" / "old.md").write_text("旧概念", encoding="utf-8")
-    (wiki / "indexes" / "concepts.json").write_text("[]", encoding="utf-8")
-    (wiki / "indexes" / "chunks.jsonl").write_text("{}\n", encoding="utf-8")
-    summary_path = wiki / "papers" / f"{PAPER_ID}.md"
-    summary_path.write_text(summary_path.read_text(encoding="utf-8") + "\n## 关键主张\n\n旧主张\n", encoding="utf-8")
-    assert migrate_wiki(tmp_path)["status"] == "published"
-    assert not (wiki / "concepts").exists()
-    assert "关键主张" not in summary_path.read_text(encoding="utf-8")
-
-
-def test_qa_loads_only_evidence_linked_from_selected_summaries(tmp_path: Path) -> None:
-    _raw_tree(tmp_path, PAPER_ID)
-    _raw_tree(tmp_path, "paper-2")
-    assert run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")["status"] == "published"
-    assert run_ingest_from_raw(tmp_path, "paper-2", llm_mode="mock")["status"] == "published"
-    chunks, evidence = retrieve(tmp_path, "方法")
-    assert {chunk["kind"] for chunk in chunks} == {"summary", "evidence"}
-    assert evidence
-    result = run_qa(tmp_path, "方法", llm_mode="mock")
-    assert result["status"] == "completed"
-    cited = result["qa"]["citations"]
-    assert cited and all(item["evidence_id"] in evidence for item in cited)

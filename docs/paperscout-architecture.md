@@ -55,7 +55,7 @@ Ingest Agent 直接输出 Markdown；宿主添加标题和元数据后写入 Wik
 - raw 目录哈希在生成前后保持一致；
 - sources 路径和摘要 evidence 标记可解析。
 
-校验失败时由同一 Agent 修复一次；第二次失败不发布。已有 Wiki 进入 staging 时，迁移会删除旧 `concepts/`、`concepts.json`、`chunks.jsonl`，并移除旧摘要末尾的“关键主张”栏目。
+校验失败时由同一 Agent 修复一次；第二次失败不发布。旧 Wiki 不进入新流程；保留不可变 raw 并使用当前契约重新生成。
 
 ## 5. QA 证据链
 

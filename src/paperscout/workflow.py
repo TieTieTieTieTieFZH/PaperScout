@@ -1,34 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
-from .health import review_wiki, write_health_report_for_wiki
+from .health import check_wiki_rules, write_health_report_for_wiki
 from .importer import import_preparsed
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
 from .mineru import parse_with_mineru_api
 from .evidence import extract_section_evidence
-from .models import QAResult, ReviewResult, RunEvent
+from .models import AgentKind, EventKind, IngestGraphState, ReviewVerdict, RunStatus, WorkflowEvent
 from .prompts import INGEST_SYSTEM_PROMPT, build_ingest_repair_prompt, build_ingest_user_prompt
 from .storage import FileSystemStore, read_json, sha256_file, write_json
 from .wiki import (
-    migrate_legacy_wiki, render_citable_sections, render_paper_wiki, retrieve,
-    validate_qa, validate_wiki_markdown, write_canonical_indexes, write_section_evidence,
+    render_citable_sections, render_paper_wiki, validate_wiki_markdown,
+    write_canonical_indexes, write_section_evidence,
 )
-
-
-class PipelineState(TypedDict, total=False):
-    run_id: str
-    workspace: str
-    paper_id: str
-    question: str
-    mode: str
-    current_node: str
-    review: dict[str, Any]
-    qa_result: dict[str, Any]
 
 
 class IngestCoverageError(ValueError):
@@ -43,16 +33,43 @@ def _provider(mode: str):
     raise ValueError("llm_mode must be 'mock' or 'real'")
 
 
-def _event(store: FileSystemStore, state: PipelineState, event_type: str, node: str, message: str, data: dict[str, Any] | None = None) -> None:
-    store.append_event(state["run_id"], RunEvent(event_type=event_type, node=node, message=message, data=data or {}))
-    store.checkpoint(state["run_id"], dict(state))
+def _event(
+    store: FileSystemStore,
+    state: IngestGraphState,
+    event_type: EventKind,
+    node: str,
+    message: str,
+    data: dict[str, Any] | None = None,
+    *,
+    agent: AgentKind = AgentKind.HOST,
+) -> None:
+    store.append_event(
+        WorkflowEvent(
+            event_id=uuid.uuid4().hex,
+            sequence=state.event_sequence,
+            run_id=state.run_id,
+            thread_id=state.thread_id,
+            agent=agent,
+            event_type=event_type,
+            node=node,
+            message=message,
+            data=data or {},
+        )
+    )
+    state.event_sequence += 1
 
 
-def _new_run(store: FileSystemStore, mode: str, paper_id: str, question: str | None = None) -> PipelineState:
-    state: PipelineState = {"run_id": uuid.uuid4().hex, "workspace": str(store.workspace), "paper_id": paper_id, "mode": mode}
-    if question is not None:
-        state["question"] = question
-    store.checkpoint(state["run_id"], state)
+def _new_run(store: FileSystemStore, mode: str, paper_id: str) -> IngestGraphState:
+    run_id = uuid.uuid4().hex
+    state = IngestGraphState(
+        run_id=run_id,
+        thread_id=f"ingest:{run_id}",
+        workspace=str(store.workspace),
+        paper_id=paper_id,
+        llm_mode=mode,
+        status=RunStatus.RUNNING,
+    )
+    _event(store, state, EventKind.RUN_STARTED, "ingest", "Ingest run started")
     return state
 
 
@@ -122,7 +139,7 @@ def prepare_ingest_context(store: FileSystemStore, paper_id: str, context_window
     }
 
 
-def ingest_agent(provider: Any, context: dict[str, Any], event_callback: Any | None = None) -> str:
+def ingest_agent(provider: Any, context: dict[str, Any]) -> str:
     prompt = build_ingest_user_prompt(paper=context["paper"], citable_document=context["citable_document"])
     return provider.generate_raw_text(
         [{"role": "system", "content": INGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
@@ -138,14 +155,13 @@ def repair_ingest_summary(provider: Any, raw_output: str, error: str, context: d
     )
 
 
-def render_wiki(store: FileSystemStore, state: PipelineState, context: dict[str, Any], candidate: Any) -> Path:
+def render_wiki(store: FileSystemStore, state: IngestGraphState, context: dict[str, Any], candidate: Any) -> Path:
     """Publish only deterministic artifacts derived from a validated Markdown body."""
-    store.run_dir(state["run_id"]).mkdir(parents=True, exist_ok=True)
+    store.run_dir(state.run_id).mkdir(parents=True, exist_ok=True)
     paper_markdown = render_paper_wiki(context["paper"], candidate)
-    (store.run_dir(state["run_id"]) / "ingest-summary.md").write_text(paper_markdown, encoding="utf-8")
-    staging = store.prepare_staging_wiki(state["run_id"])
-    migrate_legacy_wiki(staging)
-    paper_id = state["paper_id"]
+    (store.run_dir(state.run_id) / "ingest-summary.md").write_text(paper_markdown, encoding="utf-8")
+    staging = store.prepare_staging_wiki(state.run_id)
+    paper_id = state.paper_id
     write_section_evidence(staging, context["evidence"])
     paper_path = staging / "papers" / f"{paper_id}.md"
     paper_path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,91 +177,76 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
     window = getattr(getattr(provider, "settings", None), "ingest_context_window", 128_000)
     state = _new_run(store, llm_mode, paper_id)
     try:
-        state["current_node"] = "prepare_ingest_context"
-        _event(store, state, "node_started", state["current_node"], "Preparing citable raw evidence")
+        state.current_node = "prepare_ingest_context"
         context = prepare_ingest_context(store, paper_id, window)
-        _event(
-            store,
-            state,
-            "node_completed",
-            state["current_node"],
-            "Prepared section evidence",
-            {
-                "evidence_count": len(context["evidence"]),
-                "truncated": context["coverage"].truncated,
-                "last_included_content_index": context["coverage"].last_included_content_index,
-            },
-        )
-
-        callback = lambda event_type, node, message, data: _event(store, state, event_type, node, message, data)
-        state["current_node"] = "ingest_agent"
-        _event(store, state, "node_started", state["current_node"], "Requesting final summary Markdown")
-        raw_output = ingest_agent(provider, context, callback)
-        (store.run_dir(state["run_id"]) / "ingest-output-1.md").write_text(raw_output, encoding="utf-8")
+        state.input_coverage = context["coverage"]
+        state.input_evidence_ids = [item.evidence_id for item in context["evidence"]]
+        state.current_node = "ingest_agent"
+        _event(store, state, EventKind.MODEL_STARTED, state.current_node, "Requesting Wiki candidate", agent=AgentKind.INGEST)
+        raw_output = ingest_agent(provider, context)
+        state.attempt = 1
+        state.candidate_markdown = raw_output
+        state.candidate_sha256 = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
+        _event(store, state, EventKind.MODEL_COMPLETED, state.current_node, "Received Wiki candidate", {"attempt": 1}, agent=AgentKind.INGEST)
+        (store.run_dir(state.run_id) / "ingest-output-1.md").write_text(raw_output, encoding="utf-8")
         try:
             candidate = validate_wiki_markdown(raw_output, paper=context["paper"], evidence=context["evidence"])
         except ValueError as first_error:
-            write_json(store.run_dir(state["run_id"]) / "validation-errors-1.json", {"error": str(first_error)})
-            _event(store, state, "validation_failed", "validate_summary_markdown", str(first_error), {"attempt": 1})
+            state.rule_errors = [str(first_error)]
+            write_json(store.run_dir(state.run_id) / "validation-errors-1.json", {"error": str(first_error)})
+            _event(store, state, EventKind.MODEL_STARTED, "repair_ingest", "Requesting repaired Wiki candidate", {"attempt": 2}, agent=AgentKind.INGEST)
             repaired = repair_ingest_summary(provider, raw_output, str(first_error), context)
-            (store.run_dir(state["run_id"]) / "ingest-output-2.md").write_text(repaired, encoding="utf-8")
+            state.attempt = 2
+            state.candidate_markdown = repaired
+            state.candidate_sha256 = hashlib.sha256(repaired.encode("utf-8")).hexdigest()
+            _event(store, state, EventKind.MODEL_COMPLETED, "repair_ingest", "Received repaired Wiki candidate", {"attempt": 2}, agent=AgentKind.INGEST)
+            (store.run_dir(state.run_id) / "ingest-output-2.md").write_text(repaired, encoding="utf-8")
             try:
                 candidate = validate_wiki_markdown(repaired, paper=context["paper"], evidence=context["evidence"])
             except ValueError as second_error:
-                write_json(store.run_dir(state["run_id"]) / "validation-errors-2.json", {"error": str(second_error)})
-                result = {"status": "failed", "paper_id": paper_id, "error": str(second_error), "run_id": state["run_id"]}
-                _event(store, state, "run_finished", "validate_summary_markdown", "failed")
-                store.write_result(state["run_id"], result)
+                state.rule_errors.append(str(second_error))
+                state.status = RunStatus.FAILED
+                state.last_error = str(second_error)
+                write_json(store.run_dir(state.run_id) / "validation-errors-2.json", {"error": str(second_error)})
+                result = {"status": "failed", "paper_id": paper_id, "error": str(second_error), "run_id": state.run_id}
+                _event(store, state, EventKind.RUN_FAILED, "validate_wiki", str(second_error))
+                store.write_result(state.run_id, result)
                 return result
 
         if _raw_hashes(context["raw_dir"]) != context["raw_hashes"]:
             raise RuntimeError("Raw input changed during ingest; refusing to publish")
-        state["current_node"] = "render_wiki"
+        state.current_node = "render_wiki"
         staging = render_wiki(store, state, context, candidate)
+        state.staging_path = str(staging)
         write_health_report_for_wiki(staging)
-        reviewed = review_wiki(staging)
-        state["review"] = reviewed.model_dump()
-        if reviewed.status != "supported":
-            result = {"status": "failed", "paper_id": paper_id, "review": state["review"], "run_id": state["run_id"]}
-            store.write_result(state["run_id"], result)
+        _event(store, state, EventKind.REVIEW_STARTED, "wiki_rules", "Checking staged Wiki rules")
+        reviewed = check_wiki_rules(staging)
+        state.review = reviewed
+        _event(store, state, EventKind.REVIEW_COMPLETED, "wiki_rules", "Completed staged Wiki rule check", {"verdict": reviewed.verdict.value})
+        if reviewed.verdict != ReviewVerdict.APPROVE:
+            state.status = RunStatus.FAILED
+            result = {"status": "failed", "paper_id": paper_id, "review": reviewed.model_dump(mode="json"), "run_id": state.run_id}
+            _event(store, state, EventKind.RUN_FAILED, "wiki_rules", "Staged Wiki failed rule checks")
+            store.write_result(state.run_id, result)
             return result
-        store.publish_staged_wiki(state["run_id"])
-        result = {"status": "published", "paper_id": paper_id, "review": state["review"], "run_id": state["run_id"]}
-        _event(store, state, "wiki_published", "render_wiki", "Published reviewed Wiki")
-        store.write_result(state["run_id"], result)
+        store.publish_staged_wiki(state.run_id)
+        state.published = True
+        state.status = RunStatus.COMPLETED
+        result = {"status": "published", "paper_id": paper_id, "review": reviewed.model_dump(mode="json"), "run_id": state.run_id}
+        _event(store, state, EventKind.RUN_COMPLETED, "publish_wiki", "Published reviewed Wiki")
+        store.write_result(state.run_id, result)
         return result
     except Exception as exc:
-        _event(store, state, "run_failed", state.get("current_node", "ingest"), str(exc))
-        result = {"status": "failed", "paper_id": paper_id, "error": str(exc), "run_id": state["run_id"]}
-        store.write_result(state["run_id"], result)
+        state.status = RunStatus.FAILED
+        state.last_error = str(exc)
+        _event(store, state, EventKind.RUN_FAILED, state.current_node or "ingest", str(exc))
+        result = {"status": "failed", "paper_id": paper_id, "error": str(exc), "run_id": state.run_id}
+        store.write_result(state.run_id, result)
         return result
 
 
 def run_ingest_from_raw(workspace: Path, paper_id: str, llm_mode: str = "mock") -> dict[str, Any]:
     return _run_ingest_from_raw_store(FileSystemStore(workspace), paper_id, llm_mode)
-
-
-def migrate_wiki(workspace: Path) -> dict[str, Any]:
-    """Publish a legacy-artifact cleanup without reading raw or calling an LLM."""
-    store = FileSystemStore(workspace)
-    if not store.wiki.is_dir():
-        raise FileNotFoundError("Published Wiki does not exist")
-    state = _new_run(store, "migration", "wiki-migration")
-    state["current_node"] = "migrate_wiki"
-    staging = store.prepare_staging_wiki(state["run_id"])
-    migrate_legacy_wiki(staging)
-    write_health_report_for_wiki(staging)
-    reviewed = review_wiki(staging)
-    state["review"] = reviewed.model_dump()
-    if reviewed.status != "supported":
-        result = {"status": "failed", "review": state["review"], "run_id": state["run_id"]}
-        store.write_result(state["run_id"], result)
-        return result
-    store.publish_staged_wiki(state["run_id"])
-    result = {"status": "published", "review": state["review"], "run_id": state["run_id"]}
-    _event(store, state, "wiki_migrated", "migrate_wiki", "Published migrated Wiki")
-    store.write_result(state["run_id"], result)
-    return result
 
 
 def run_ingest(
@@ -267,26 +268,3 @@ def run_ingest(
     else:
         imported = import_preparsed(workspace, mineru_path, source_pdf, paper_id, title, authors, year)
     return _run_ingest_from_raw_store(store, imported.paper_id, llm_mode)
-
-
-def run_qa(workspace: Path, question: str, paper_id: str | None = None, llm_mode: str = "mock") -> dict[str, Any]:
-    store = FileSystemStore(workspace)
-    if not (store.wiki / "indexes" / "sources.json").exists():
-        raise FileNotFoundError("Published Wiki does not exist; run run_ingest first")
-    state = _new_run(store, llm_mode, paper_id or "cross-paper", question)
-    provider = _provider(llm_mode)
-    chunks, evidence_by_id = retrieve(store.workspace, question, paper_id=paper_id)
-    instruction = "Answer only from the supplied summaries and evidence. Cite only supplied evidence_id/page/quote records; state when evidence is insufficient."
-    raw_qa = provider.generate_qa(question, chunks) if isinstance(provider, MockLLM) else provider.generate_json(instruction, {"question": question, "chunks": chunks})
-    try:
-        qa = QAResult.model_validate(raw_qa)
-        status, feedback = validate_qa(qa, evidence_by_id)
-    except ValueError as exc:
-        status, feedback, qa = "unsupported", [str(exc)], QAResult(answer="")
-    review = ReviewResult(status=status, feedback=feedback, checked_evidence=len(evidence_by_id))
-    state["qa_result"] = qa.model_dump()
-    state["review"] = review.model_dump()
-    result = {"status": "completed" if status == "supported" else "failed", "qa": state["qa_result"], "review": state["review"]}
-    _event(store, state, "run_finished", "retrieval_qa", result["status"], {"retrieved_chunks": len(chunks)})
-    store.write_result(state["run_id"], result)
-    return result

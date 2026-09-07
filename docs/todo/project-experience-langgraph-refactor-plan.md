@@ -179,7 +179,7 @@ Review 是显式工作流节点和审核门，不作为普通 Hook 隐藏在写�
 2. 固化 evidence ID 生成和 `text_level: 2` 分段规则；
 3. 明确 Markdown 中 evidence 标记的解析规则；
 4. 将宿主确定性校验从 Agent Prompt 中分离；
-5. 为现有数据建立兼容层，避免重构时破坏已有 raw 和 Wiki。
+5. 保持现有 raw 不变；旧 Wiki 不兼容迁移，统一按新契约重新生成。
 
 完成标准：同一份 MinerU 输入能够稳定产生相同 evidence ID；所有 Graph 节点共享明确的数据模型。
 
@@ -278,4 +278,4 @@ run.failed
 - Review 作为显式 Graph 节点，不隐藏在普通 Hook 中；
 - Checkpoint 保存执行状态，Session Memory 保存对话语义，两者分开设计；
 - 优先完成 P0 的可信闭环，再增加事件流和高级 Harness 能力；
-- 重构期间保持现有文件兼容，避免一次性更换全部存储格式。
+- 重构期间保持 raw 来源层不变；Wiki 属于可重建产物，不保留旧格式兼容逻辑。
