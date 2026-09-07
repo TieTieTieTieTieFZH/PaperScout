@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 已由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；Retrieval QA、Session、语义 Review 和中断恢复仍在开发。
+- 当前 Wiki Ingest 已由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer，包含确定性规则与独立 Wiki Review Chat Client；Retrieval QA、Session、Answer Review 和中断恢复仍在开发。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
@@ -103,7 +103,7 @@ run_ingest_from_raw(
 )
 ```
 
-如果同一 `paper_id` 已有 Wiki、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。发布时会对完整 staging Wiki 执行本地规则审核，审核失败不会向 `wiki/` 发布任何文件。
+如果同一 `paper_id` 已有 Wiki、evidence 或 source index，调用会在请求 LLM 前拒绝执行，避免覆盖已发布 Wiki。每次运行都会保存最终 `ingest-summary.md`，或失败时的原始输出、校验错误和事件记录。候选先通过本地结构规则，再由独立、无工具、无 Session 的 Wiki Review 审核；`REVISE/REJECT` 最多驱动一次完整重生成，非法 verdict 或超过最大次数均失败关闭。每次语义审核的 request、response 和 result 保存在 `runs/{run_id}/review/wiki/{attempt}/`。最后还会对完整 staging Wiki 执行确定性审核，任一审核失败都不会向 `wiki/` 发布文件。
 
 旧 Wiki 不提供兼容迁移；保留不可变 `raw/`，使用当前 Ingest 重新生成 Wiki。
 
@@ -152,5 +152,6 @@ llmwiki/
     └── {run_id}/
         ├── events.jsonl
         ├── result.json
+        ├── review/wiki/{attempt}/
         └── staging/wiki/
 ```

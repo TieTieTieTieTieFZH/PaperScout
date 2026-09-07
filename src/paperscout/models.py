@@ -266,6 +266,7 @@ class IngestGraphState(BaseModel):
     candidate_sha256: str | None = None
     rule_errors: list[str] = Field(default_factory=list)
     review: ReviewDecision | None = None
+    rule_review: ReviewDecision | None = None
     attempt: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)
     staging_path: str | None = None

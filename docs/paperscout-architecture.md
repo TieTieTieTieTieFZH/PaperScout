@@ -17,7 +17,9 @@ PDF
   -> raw/papers/{paper_id}/mineru/content_list.json
   -> 宿主生成带 evidence ID 的可引用 Markdown
   -> Wiki Ingest Agent 输出五栏摘要 Markdown
-  -> 本地校验、staging 审核与原子发布
+  -> 本地候选规则校验
+  -> 独立 Wiki Review Chat Client
+  -> staging 完整性审核与原子发布
 ```
 
 `content_list.json` 是 Ingest 的唯一权威来源。宿主以 `type: text`、`text_level: 2` 标题开始一个 section evidence，并按标题原始数组下标生成 `<paper_id>:sNNNN`；跳过页眉或页脚等噪声块不会改变 ID。
@@ -74,4 +76,4 @@ QA 不能引用未由命中摘要加载的 evidence。证据不足时，必须�
 
 每个运行保存状态、事件、模型原始输出、校验错误和最终结果。发布以完整 staging Wiki 的原子替换完成，避免产生半更新的 Wiki。
 
-LangGraph 运行时使用 `runtime/checkpoints.sqlite` 保存 thread checkpoint。当前 Ingest 已拆为上下文、生成、校验、修复、raw 复核、staging、规则审核、发布前复核、发布和失败终态节点，并通过显式条件边运行。Checkpoint、用户可读 Session 和审计事件仍是三个独立契约；当前只验证了 Ingest 节点终态可在 runtime 重建后读取，中断后续跑属于后续恢复阶段。
+LangGraph 运行时使用 `runtime/checkpoints.sqlite` 保存 thread checkpoint。当前 Ingest 已拆为上下文、生成、校验、规则修复、raw 复核、语义 Wiki Review、Review 驱动重生成、staging、完整性审核、发布前复核、发布和失败终态节点，并通过显式条件边运行。语义 Review 的每次请求、原始响应和严格 verdict 均保存在运行目录；无法解析 verdict 或超过最大生成次数会失败关闭。Checkpoint、用户可读 Session 和审计事件仍是三个独立契约；当前只验证了 Ingest 节点终态可在 runtime 重建后读取，中断后续跑属于后续恢复阶段。

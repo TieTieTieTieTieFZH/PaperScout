@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from paperscout.graph_runtime import GraphRuntime, graph_config
-from paperscout.models import EventKind, ReviewDecision, ReviewVerdict, WorkflowEvent
+from paperscout.models import AgentKind, EventKind, ReviewDecision, ReviewVerdict, WorkflowEvent
 from paperscout.workflow import build_ingest_graph, run_ingest_from_raw
 
 
@@ -192,6 +192,8 @@ def test_ingest_runs_as_checkpointed_state_graph(tmp_path: Path) -> None:
         "verify_raw",
         "render_wiki",
         "wiki_rules",
+        "wiki_review",
+        "revise_ingest",
         "verify_publish",
         "publish_wiki",
         "fail_run",
@@ -234,14 +236,14 @@ def test_rule_review_rejection_is_checkpointed_and_never_publishes(
     result = run_ingest_from_raw(tmp_path, PAPER_ID, llm_mode="mock")
 
     assert result["status"] == "failed"
-    assert result["review"] == rejected.model_dump(mode="json")
+    assert result["rule_review"] == rejected.model_dump(mode="json")
     assert not (tmp_path / "wiki").exists()
     with GraphRuntime.open(tmp_path) as runtime:
         graph = build_ingest_graph(runtime, provider=SequenceProvider([_summary()]), context_window=128_000)
         snapshot = graph.get_state(graph_config(f"ingest:{result['run_id']}"))
     assert snapshot.values["status"] == "failed"
     assert snapshot.values["current_node"] == "fail_run"
-    assert snapshot.values["review"]["verdict"] == "REJECT"
+    assert snapshot.values["rule_review"]["verdict"] == "REJECT"
 
 
 def test_raw_change_during_review_prevents_publish(
@@ -261,3 +263,86 @@ def test_raw_change_during_review_prevents_publish(
     assert result["status"] == "failed"
     assert "Raw input changed during ingest" in result["error"]
     assert not (tmp_path / "wiki").exists()
+
+
+def test_wiki_review_receives_only_cited_evidence_and_writes_audit_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    ingest_provider = SequenceProvider([_summary()])
+    review_provider = SequenceProvider(["VERDICT: APPROVE\n\n未发现需要修改的问题。"])
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: ingest_provider)
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: review_provider)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert result["status"] == "published"
+    assert review_provider.calls == 1
+    review_prompt = review_provider.messages[0][1]["content"]
+    assert f"evidence:{PAPER_ID}:s0001" in review_prompt
+    assert f"evidence:{PAPER_ID}:s0003" not in review_prompt
+    audit = tmp_path / "runs" / result["run_id"] / "review" / "wiki" / "1"
+    assert (audit / "request.md").read_text(encoding="utf-8") == review_prompt
+    assert (audit / "response.md").is_file()
+    assert json.loads((audit / "result.json").read_text(encoding="utf-8"))["verdict"] == "APPROVE"
+    events = [
+        WorkflowEvent.model_validate_json(line)
+        for line in (tmp_path / "runs" / result["run_id"] / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    semantic_events = [event for event in events if event.agent == AgentKind.WIKI_REVIEW]
+    assert [event.event_type for event in semantic_events] == [EventKind.REVIEW_STARTED, EventKind.REVIEW_COMPLETED]
+
+
+def test_wiki_review_revise_regenerates_and_reviews_full_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raw_tree(tmp_path)
+    ingest_provider = SequenceProvider([_summary(), _summary()])
+    review_provider = SequenceProvider(
+        [
+            "VERDICT: REVISE\n\n请缩小结论范围。",
+            "VERDICT: APPROVE\n\n未发现需要修改的问题。",
+        ]
+    )
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: ingest_provider)
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: review_provider)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert result["status"] == "published"
+    assert ingest_provider.calls == 2
+    assert review_provider.calls == 2
+    assert "请缩小结论范围" in ingest_provider.messages[1][1]["content"]
+    review_root = tmp_path / "runs" / result["run_id"] / "review" / "wiki"
+    assert (review_root / "1" / "result.json").is_file()
+    assert (review_root / "2" / "result.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "review_outputs",
+    [
+        ["VERDICT: REJECT\n\n内容与原文不一致。", "VERDICT: REJECT\n\n仍与原文不一致。"],
+        ["审核通过，但没有合法状态行。"],
+    ],
+)
+def test_wiki_review_failure_never_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, review_outputs: list[str]
+) -> None:
+    _raw_tree(tmp_path)
+    ingest_provider = SequenceProvider([_summary(), _summary()])
+    review_provider = SequenceProvider(review_outputs)
+    monkeypatch.setattr("paperscout.workflow._provider", lambda mode: ingest_provider)
+    monkeypatch.setattr("paperscout.workflow._review_provider", lambda mode: review_provider)
+
+    result = run_ingest_from_raw(tmp_path, PAPER_ID)
+
+    assert result["status"] == "failed"
+    assert not (tmp_path / "wiki").exists()
+    if len(review_outputs) == 2:
+        assert ingest_provider.calls == 2
+        assert review_provider.calls == 2
+        assert result["review"]["verdict"] == "REJECT"
+    else:
+        assert ingest_provider.calls == 1
+        assert review_provider.calls == 1
+        assert "VERDICT" in result["error"]

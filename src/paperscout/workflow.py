@@ -24,7 +24,15 @@ from .models import (
     RunStatus,
     WorkflowEvent,
 )
-from .prompts import INGEST_SYSTEM_PROMPT, build_ingest_repair_prompt, build_ingest_user_prompt
+from .prompts import (
+    INGEST_SYSTEM_PROMPT,
+    WIKI_REVIEW_SYSTEM_PROMPT,
+    build_ingest_repair_prompt,
+    build_ingest_review_revision_prompt,
+    build_ingest_user_prompt,
+    build_wiki_review_prompt,
+)
+from .review import parse_review_response
 from .storage import FileSystemStore, read_json, sha256_file, write_json
 from .wiki import (
     render_citable_sections, render_paper_wiki, validate_wiki_markdown,
@@ -45,6 +53,14 @@ class IngestCoverageError(ValueError):
 
 
 def _provider(mode: str):
+    if mode == "mock":
+        return MockLLM()
+    if mode == "real":
+        return OpenAICompatibleResponsesLLM()
+    raise ValueError("llm_mode must be 'mock' or 'real'")
+
+
+def _review_provider(mode: str):
     if mode == "mock":
         return MockLLM()
     if mode == "real":
@@ -176,6 +192,24 @@ def repair_ingest_summary(provider: Any, raw_output: str, error: str, context: d
     )
 
 
+def revise_ingest_summary(
+    provider: Any,
+    raw_output: str,
+    verdict: ReviewVerdict,
+    feedback: list[str],
+    context: dict[str, Any],
+) -> str:
+    prompt = build_ingest_review_revision_prompt(
+        raw_output=raw_output,
+        verdict=verdict.value,
+        feedback=feedback,
+        citable_document=context["citable_document"],
+    )
+    return provider.generate_raw_text(
+        [{"role": "system", "content": INGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+    )
+
+
 def render_wiki(store: FileSystemStore, state: IngestGraphState, context: dict[str, Any], candidate: Any) -> Path:
     """Publish only deterministic artifacts derived from a validated Markdown body."""
     store.run_dir(state.run_id).mkdir(parents=True, exist_ok=True)
@@ -205,8 +239,15 @@ def _stored_context(state: IngestGraphState) -> dict[str, Any]:
     }
 
 
-def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: int):
+def build_ingest_graph(
+    runtime: GraphRuntime,
+    *,
+    provider: Any,
+    context_window: int,
+    review_provider: Any | None = None,
+):
     """Compile the real Ingest StateGraph against the owned SQLite checkpointer."""
+    review_provider = review_provider or MockLLM()
 
     def prepare_node(state: IngestGraphState) -> dict[str, Any]:
         state.current_node = "prepare_ingest_context"
@@ -334,6 +375,123 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
                 "last_error": str(exc),
             }
 
+    def wiki_review_node(state: IngestGraphState) -> dict[str, Any]:
+        state.current_node = "wiki_review"
+        store = FileSystemStore(Path(state.workspace))
+        audit = store.run_dir(state.run_id) / "review" / "wiki" / str(state.attempt)
+        try:
+            context = _stored_context(state)
+            if state.candidate_markdown is None:
+                raise ValueError("Ingest candidate Markdown is missing")
+            candidate = validate_wiki_markdown(
+                state.candidate_markdown,
+                paper=context["paper"],
+                evidence=context["evidence"],
+            )
+            cited_ids = {
+                evidence_id
+                for section in candidate.sections
+                for evidence_id in section.evidence_ids
+            }
+            cited_evidence = [item for item in context["evidence"] if item.evidence_id in cited_ids]
+            request = build_wiki_review_prompt(
+                paper=context["paper"],
+                candidate_markdown=state.candidate_markdown,
+                evidence_document=render_citable_sections(cited_evidence),
+            )
+            audit.mkdir(parents=True, exist_ok=False)
+            (audit / "request.md").write_text(request, encoding="utf-8")
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_STARTED,
+                state.current_node,
+                "Requesting semantic Wiki review",
+                {"attempt": state.attempt, "evidence_ids": sorted(cited_ids)},
+                agent=AgentKind.WIKI_REVIEW,
+            )
+            response = review_provider.generate_raw_text(
+                [
+                    {"role": "system", "content": WIKI_REVIEW_SYSTEM_PROMPT},
+                    {"role": "user", "content": request},
+                ]
+            )
+            (audit / "response.md").write_text(response, encoding="utf-8")
+            decision = parse_review_response(response)
+            write_json(audit / "result.json", decision.model_dump(mode="json"))
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_COMPLETED,
+                state.current_node,
+                "Completed semantic Wiki review",
+                {"attempt": state.attempt, "verdict": decision.verdict.value},
+                agent=AgentKind.WIKI_REVIEW,
+            )
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "review": decision.model_dump(mode="json"),
+                "last_error": None,
+            }
+        except Exception as exc:
+            if audit.is_dir() and not (audit / "result.json").exists():
+                write_json(audit / "result.json", {"status": "failed", "error": str(exc)})
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "last_error": str(exc),
+            }
+
+    def revise_node(state: IngestGraphState) -> dict[str, Any]:
+        state.current_node = "revise_ingest"
+        store = FileSystemStore(Path(state.workspace))
+        try:
+            if state.candidate_markdown is None or state.review is None:
+                raise RuntimeError("Cannot revise without a candidate and semantic review")
+            attempt = state.attempt + 1
+            _event(
+                store,
+                state,
+                EventKind.MODEL_STARTED,
+                state.current_node,
+                "Regenerating Wiki candidate from Review feedback",
+                {"attempt": attempt, "verdict": state.review.verdict.value},
+                agent=AgentKind.INGEST,
+            )
+            revised = revise_ingest_summary(
+                provider,
+                state.candidate_markdown,
+                state.review.verdict,
+                state.review.feedback,
+                _stored_context(state),
+            )
+            _event(
+                store,
+                state,
+                EventKind.MODEL_COMPLETED,
+                state.current_node,
+                "Received regenerated Wiki candidate",
+                {"attempt": attempt},
+                agent=AgentKind.INGEST,
+            )
+            (store.run_dir(state.run_id) / f"ingest-output-{attempt}.md").write_text(revised, encoding="utf-8")
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "attempt": attempt,
+                "candidate_markdown": revised,
+                "candidate_sha256": hashlib.sha256(revised.encode("utf-8")).hexdigest(),
+                "review": None,
+                "last_error": None,
+            }
+        except Exception as exc:
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "last_error": str(exc),
+            }
+
     def verify_raw_node(state: IngestGraphState) -> dict[str, Any]:
         state.current_node = "verify_raw"
         try:
@@ -382,7 +540,7 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
             return {
                 "current_node": state.current_node,
                 "event_sequence": state.event_sequence,
-                "review": reviewed.model_dump(mode="json"),
+                "rule_review": reviewed.model_dump(mode="json"),
                 "last_error": error,
             }
         except Exception as exc:
@@ -403,6 +561,7 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
                 "status": "published",
                 "paper_id": state.paper_id,
                 "review": state.review.model_dump(mode="json") if state.review else None,
+                "rule_review": state.rule_review.model_dump(mode="json") if state.rule_review else None,
                 "run_id": state.run_id,
             }
             _event(store, state, EventKind.RUN_COMPLETED, state.current_node, "Published reviewed Wiki")
@@ -436,6 +595,8 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
         }
         if state.review is not None:
             result["review"] = state.review.model_dump(mode="json")
+        if state.rule_review is not None:
+            result["rule_review"] = state.rule_review.model_dump(mode="json")
         if state.input_coverage is not None:
             result["coverage"] = state.input_coverage.model_dump(mode="json")
         _event(store, state, EventKind.RUN_FAILED, failed_node, message)
@@ -457,8 +618,15 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
             return "valid"
         return "repair" if state.attempt < state.max_attempts else "fail"
 
-    def route_review(state: IngestGraphState) -> str:
-        return "approve" if state.last_error is None and state.review is not None else "fail"
+    def route_semantic_review(state: IngestGraphState) -> str:
+        if state.last_error is not None or state.review is None:
+            return "fail"
+        if state.review.verdict == ReviewVerdict.APPROVE:
+            return "approve"
+        return "revise" if state.attempt < state.max_attempts else "fail"
+
+    def route_rule_review(state: IngestGraphState) -> str:
+        return "approve" if state.last_error is None and state.rule_review is not None else "fail"
 
     def verify_publish_node(state: IngestGraphState) -> dict[str, Any]:
         state.current_node = "verify_publish"
@@ -483,6 +651,8 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
     builder.add_node("validate_wiki", validate_node)
     builder.add_node("repair_ingest", repair_node)
     builder.add_node("verify_raw", verify_raw_node)
+    builder.add_node("wiki_review", wiki_review_node)
+    builder.add_node("revise_ingest", revise_node)
     builder.add_node("render_wiki", render_node)
     builder.add_node("wiki_rules", review_node)
     builder.add_node("verify_publish", verify_publish_node)
@@ -505,11 +675,17 @@ def build_ingest_graph(runtime: GraphRuntime, *, provider: Any, context_window: 
         route_error,
         {"continue": "validate_wiki", "fail": "fail_run"},
     )
-    builder.add_conditional_edges("verify_raw", route_error, {"continue": "render_wiki", "fail": "fail_run"})
+    builder.add_conditional_edges("verify_raw", route_error, {"continue": "wiki_review", "fail": "fail_run"})
+    builder.add_conditional_edges(
+        "wiki_review",
+        route_semantic_review,
+        {"approve": "render_wiki", "revise": "revise_ingest", "fail": "fail_run"},
+    )
+    builder.add_conditional_edges("revise_ingest", route_error, {"continue": "validate_wiki", "fail": "fail_run"})
     builder.add_conditional_edges("render_wiki", route_error, {"continue": "wiki_rules", "fail": "fail_run"})
     builder.add_conditional_edges(
         "wiki_rules",
-        route_review,
+        route_rule_review,
         {"approve": "verify_publish", "fail": "fail_run"},
     )
     builder.add_conditional_edges("verify_publish", route_error, {"continue": "publish_wiki", "fail": "fail_run"})
@@ -522,11 +698,17 @@ def _run_ingest_from_raw_store(store: FileSystemStore, paper_id: str, llm_mode: 
     if _existing_wiki_for_paper(store, paper_id):
         raise ValueError(f"Wiki already contains paper_id {paper_id}; refusing to overwrite published artifacts")
     provider = _provider(llm_mode)
+    review_provider = _review_provider(llm_mode)
     window = getattr(getattr(provider, "settings", None), "ingest_context_window", 128_000)
     state = _new_run(store, llm_mode, paper_id)
     try:
         with GraphRuntime.open(store.workspace) as runtime:
-            graph = build_ingest_graph(runtime, provider=provider, context_window=window)
+            graph = build_ingest_graph(
+                runtime,
+                provider=provider,
+                review_provider=review_provider,
+                context_window=window,
+            )
             final_state = graph.invoke(state.model_dump(mode="json"), graph_config(state.thread_id))
         result = final_state.get("result")
         if not isinstance(result, dict):

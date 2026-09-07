@@ -35,6 +35,8 @@ class MockLLM:
     def generate_raw_text(self, messages: list[dict[str, Any]]) -> str:
         """Return a deterministic five-section Markdown summary for local tests."""
         text = "\n".join(str(message.get("content", "")) for message in messages)
+        if "Wiki Review Chat Client" in text:
+            return "VERDICT: APPROVE\n\n未发现需要修改的问题。"
         evidence_ids = re.findall(r"<!-- evidence:([^\s|]+)", text)
         if not evidence_ids:
             return ""

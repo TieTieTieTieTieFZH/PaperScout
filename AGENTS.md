@@ -91,4 +91,4 @@ git diff --check
 
 ## 7. 当前推荐的继续方向
 
-以 `docs/refactor-progress.md` 为准选择下一个未完成切片。当前 Ingest 已接入真实 `StateGraph` 和 SQLite Checkpointer；下一优先方向是为独立 Wiki Review Chat Client 编写严格 verdict、语义拒绝、修订循环、最大尝试次数和失败不发布测试，再把 Review 接入现有条件图。不得跳过台账直接宣称完整多 Agent、QA、Session、恢复或双 Review 已完成。
+以 `docs/refactor-progress.md` 为准选择下一个未完成切片。当前 Ingest `StateGraph`、SQLite Checkpointer 和 Wiki Review Chat Client 已接入；下一优先方向是 P0-C 的受控 `read_project_file`，先验证路径边界、符号链接、参数 Schema、单次截断和累计读取预算，再接入 QA Agent Loop。不得跳过台账直接宣称完整多 Agent、QA、Session、恢复或双 Review 已完成。
