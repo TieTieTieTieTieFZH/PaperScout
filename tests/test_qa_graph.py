@@ -11,6 +11,7 @@ from paperscout.graph_runtime import GraphRuntime, graph_config
 from paperscout.models import (
     AgentToolCall,
     EventKind,
+    ProjectState,
     QAAnswer,
     ReadBudget,
     SessionMessage,
@@ -18,6 +19,7 @@ from paperscout.models import (
     WorkflowEvent,
 )
 from paperscout.qa import build_qa_graph, parse_qa_model_response, resume_qa, run_qa
+from paperscout.project_memory import persist_project_memory
 from paperscout.read_tool import model_visible_read_result, read_project_file
 from paperscout.session import persist_session
 
@@ -1038,3 +1040,197 @@ def test_stale_resource_keeps_evidence_memory_backed_by_an_unchanged_resource(
         "wiki/evidence/paper-1/s0001.md"
     ]
     assert state.memory.evidence_ids == ["paper-1:s0001"]
+
+
+def test_project_memory_is_shared_across_sessions_and_isolated_by_project(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    first_question = "记录 Alpha 项目的长期研究方向。"
+    first = run_qa(
+        workspace,
+        first_question,
+        "project-session-a",
+        project_id="project-alpha",
+        provider=ScriptedProvider(
+            [
+                _final(
+                    answer="已记录项目方向。",
+                    claims=[],
+                    cited_evidence_ids=[],
+                    memory_patch={
+                        "research_goal": "比较检索增强方法",
+                        "paper_aliases": {"基线论文": "paper-1"},
+                        "confirmed_decisions": ["先比较检索模块"],
+                        "unresolved_questions": ["生成器是否需要微调？"],
+                        "research_hypotheses": ["稀疏与稠密检索可以互补"],
+                        "evidence_ids": [],
+                    },
+                )
+            ]
+        ),
+    )
+
+    assert first["status"] == "completed"
+    assert first["project_id"] == "project-alpha"
+    project_path = workspace / "memory" / "projects" / "project-alpha" / "state.json"
+    project_payload = json.loads(project_path.read_text(encoding="utf-8"))
+    project = ProjectState.model_validate(project_payload)
+    assert project.project_id == "project-alpha"
+    assert project.memory.research_goal == "比较检索增强方法"
+    assert project.memory.confirmed_decisions == ["先比较检索模块"]
+    assert "messages" not in project_payload
+    assert "read_resources" not in project_payload
+
+    shared_provider = ScriptedProvider(
+        [
+            _final(
+                answer="已加载共享项目记忆。",
+                claims=[],
+                cited_evidence_ids=[],
+            )
+        ]
+    )
+    shared = run_qa(
+        workspace,
+        "继续 Alpha 项目。",
+        "project-session-b",
+        project_id="project-alpha",
+        provider=shared_provider,
+    )
+
+    assert shared["status"] == "completed"
+    shared_request = json.dumps(shared_provider.requests[0], ensure_ascii=False)
+    assert "当前项目 ID：project-alpha" in shared_request
+    assert "比较检索增强方法" in shared_request
+    assert "先比较检索模块" in shared_request
+    assert first_question not in shared_request
+
+    default_provider = ScriptedProvider(
+        [
+            _final(
+                answer="默认项目没有 Alpha 记忆。",
+                claims=[],
+                cited_evidence_ids=[],
+            )
+        ]
+    )
+    default = run_qa(
+        workspace,
+        "检查默认项目。",
+        "default-project-session",
+        provider=default_provider,
+    )
+
+    assert default["status"] == "completed"
+    assert default["project_id"] == "default"
+    assert "比较检索增强方法" not in json.dumps(
+        default_provider.requests[0], ensure_ascii=False
+    )
+    assert (workspace / "memory" / "projects" / "default" / "state.json").is_file()
+
+
+def test_project_id_is_safe_and_session_cannot_change_projects(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="project_id"):
+        run_qa(
+            workspace,
+            "问题",
+            "safe-session",
+            project_id="../outside",
+            provider=ScriptedProvider([]),
+        )
+    assert not (workspace / "memory" / "outside").exists()
+
+    run_qa(
+        workspace,
+        "建立项目绑定。",
+        "bound-session",
+        project_id="project-a",
+        provider=ScriptedProvider(
+            [
+                _final(
+                    answer="已建立绑定。",
+                    claims=[],
+                    cited_evidence_ids=[],
+                )
+            ]
+        ),
+    )
+    with pytest.raises(ValueError, match="project_id"):
+        run_qa(
+            workspace,
+            "不能切换项目。",
+            "bound-session",
+            project_id="project-b",
+            provider=ScriptedProvider([]),
+        )
+
+
+def test_project_memory_persistence_failure_resumes_without_repeating_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    provider = ScriptedProvider(
+        [
+            _final(
+                answer="已记录项目决策。",
+                claims=[],
+                cited_evidence_ids=[],
+                memory_patch={
+                    "confirmed_decisions": ["保留可追溯引用"],
+                },
+            )
+        ]
+    )
+    persist_then_fail_calls = 0
+
+    def persist_then_fail(*args: Any, **kwargs: Any) -> Any:
+        nonlocal persist_then_fail_calls
+        persist_then_fail_calls += 1
+        persist_project_memory(*args, **kwargs)
+        raise OSError("temporary project memory failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr("paperscout.qa.persist_project_memory", persist_then_fail)
+        interrupted = run_qa(
+            workspace,
+            "记录项目决策。",
+            "project-persist-session",
+            project_id="recovery-project",
+            provider=provider,
+        )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["complete_qa"]
+    assert "temporary project memory failure" in interrupted["error"]
+    assert len(provider.requests) == 1
+    assert persist_then_fail_calls == 1
+
+    result = resume_qa(
+        workspace,
+        interrupted["thread_id"],
+        provider=ScriptedProvider([]),
+    )
+
+    assert result["status"] == "completed"
+    assert result["project_id"] == "recovery-project"
+    project = ProjectState.model_validate_json(
+        (
+            workspace
+            / "memory"
+            / "projects"
+            / "recovery-project"
+            / "state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert project.memory.confirmed_decisions == ["保留可追溯引用"]
+    messages = (
+        workspace
+        / "memory"
+        / "sessions"
+        / "project-persist-session"
+        / "messages.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert len(messages) == 2

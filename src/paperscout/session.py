@@ -38,14 +38,19 @@ def session_dir(workspace: Path, session_id: str) -> Path:
     return path
 
 
-def load_session(workspace: Path, session_id: str) -> tuple[SessionState, list[SessionMessage]]:
+def load_session(
+    workspace: Path,
+    session_id: str,
+    *,
+    project_id: str = "default",
+) -> tuple[SessionState, list[SessionMessage]]:
     path = session_dir(workspace, session_id)
     state_path = path / "state.json"
     messages_path = path / "messages.jsonl"
     summary_path = path / "summary.md"
     present = [candidate.exists() for candidate in (state_path, messages_path, summary_path)]
     if not any(present):
-        return SessionState(session_id=session_id), []
+        return SessionState(session_id=session_id, project_id=project_id), []
     if not all(present):
         raise ValueError(f"Session {session_id} has an incomplete file set")
     if any(
@@ -57,6 +62,10 @@ def load_session(workspace: Path, session_id: str) -> tuple[SessionState, list[S
     state = SessionState.model_validate(read_json(state_path))
     if state.session_id != session_id:
         raise ValueError("Session state does not match session_id")
+    if state.project_id != project_id:
+        raise ValueError(
+            f"Session {session_id} belongs to project_id {state.project_id}, not {project_id}"
+        )
     if state.messages:
         raise ValueError("Session state must not embed the durable message log")
     summary = summary_path.read_text(encoding="utf-8")
@@ -295,6 +304,7 @@ def persist_session(
     workspace: Path,
     *,
     session_id: str,
+    project_id: str = "default",
     new_messages: list[SessionMessage],
     expected_message_count: int,
     memory: ProjectMemory,
@@ -322,6 +332,7 @@ def persist_session(
     )
     state = SessionState(
         session_id=session_id,
+        project_id=project_id,
         summary=summary,
         memory=memory,
         read_resources=read_resources,

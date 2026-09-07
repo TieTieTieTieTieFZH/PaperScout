@@ -275,6 +275,14 @@ class ProjectMemory(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class ProjectState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(min_length=1)
+    memory: ProjectMemory = Field(default_factory=ProjectMemory)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class QAClaimType(str, Enum):
     PAPER_FACT = "paper_fact"
     CROSS_PAPER_SYNTHESIS = "cross_paper_synthesis"
@@ -357,6 +365,7 @@ class SessionState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str = Field(min_length=1)
+    project_id: str = Field(default="default", min_length=1)
     messages: list[SessionMessage] = Field(default_factory=list)
     summary: str = ""
     memory: ProjectMemory = Field(default_factory=ProjectMemory)
@@ -416,6 +425,7 @@ class QAGraphState(BaseModel):
     run_id: str = Field(min_length=1)
     thread_id: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
+    project_id: str = Field(default="default", min_length=1)
     workspace: str = Field(min_length=1)
     question: str = Field(min_length=1)
     llm_mode: Literal["mock", "real"] = "mock"
@@ -427,6 +437,7 @@ class QAGraphState(BaseModel):
     memory: ProjectMemory = Field(default_factory=ProjectMemory)
     session_read_resources: list[ReadResourceRecord] = Field(default_factory=list)
     invalidated_resources: list[str] = Field(default_factory=list)
+    invalidated_evidence_ids: list[str] = Field(default_factory=list)
     session_message_count: int = Field(default=0, ge=0)
     read_resources: list[ReadResourceRecord] = Field(default_factory=list)
     read_budget: ReadBudget = Field(default_factory=ReadBudget)

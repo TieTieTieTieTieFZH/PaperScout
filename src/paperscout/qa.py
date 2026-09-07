@@ -26,6 +26,7 @@ from .models import (
     WorkflowEvent,
 )
 from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
+from .project_memory import load_project_memory, persist_project_memory
 from .read_tool import model_visible_read_result, read_project_file
 from .session import (
     load_session,
@@ -106,6 +107,7 @@ def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
         {
             "role": "system",
             "content": build_qa_context_prompt(
+                project_id=state.project_id,
                 history_summary=state.history_summary,
                 memory=state.memory.model_dump(mode="json"),
                 invalidated_resources=state.invalidated_resources,
@@ -124,29 +126,55 @@ def _new_state(
     store: FileSystemStore,
     question: str,
     session_id: str,
+    project_id: str,
     llm_mode: str,
     read_budget: ReadBudget | None,
 ) -> QAGraphState:
-    session, history = load_session(store.workspace, session_id)
+    project = load_project_memory(store.workspace, project_id)
+    session, history = load_session(
+        store.workspace,
+        session_id,
+        project_id=project_id,
+    )
+    loaded_session_memory = session.memory
     session, recent_history, invalidated_resources = invalidate_stale_session_resources(
         store.workspace,
         session,
         history,
     )
+    invalidated_evidence_ids = [
+        evidence_id
+        for evidence_id in loaded_session_memory.evidence_ids
+        if evidence_id not in session.memory.evidence_ids
+    ]
+    memory = merge_project_memory(session.memory, project.memory)
+    if invalidated_evidence_ids:
+        invalidated = set(invalidated_evidence_ids)
+        memory = memory.model_copy(
+            update={
+                "evidence_ids": [
+                    evidence_id
+                    for evidence_id in memory.evidence_ids
+                    if evidence_id not in invalidated
+                ]
+            }
+        )
     run_id = uuid.uuid4().hex
     state = QAGraphState(
         run_id=run_id,
-        thread_id=f"qa:{session_id}:{run_id}",
+        thread_id=f"qa:{project_id}:{session_id}:{run_id}",
         session_id=session_id,
+        project_id=project_id,
         workspace=str(store.workspace),
         question=question,
         llm_mode=llm_mode,
         status=RunStatus.RUNNING,
         messages=[*recent_history, _message("user", question)],
         history_summary=session.summary,
-        memory=session.memory,
+        memory=memory,
         session_read_resources=session.read_resources,
         invalidated_resources=invalidated_resources,
+        invalidated_evidence_ids=invalidated_evidence_ids,
         session_message_count=len(history),
         read_budget=read_budget or ReadBudget(),
         turn_start_message_index=len(recent_history),
@@ -157,7 +185,11 @@ def _new_state(
         EventKind.RUN_STARTED,
         "qa",
         "QA run started",
-        {"invalidated_resources": invalidated_resources},
+        {
+            "project_id": project_id,
+            "invalidated_resources": invalidated_resources,
+            "invalidated_evidence_ids": invalidated_evidence_ids,
+        },
         agent=AgentKind.QA,
     )
     return state
@@ -363,19 +395,39 @@ def build_qa_graph(
         if state.candidate_answer is None:
             return {"current_node": state.current_node, "last_error": "QA final answer is missing"}
         answer = state.candidate_answer
-        memory = merge_project_memory(state.memory, answer.memory_patch)
         session_resources = merge_read_resources(state.session_read_resources, state.read_resources)
         try:
+            latest_project = load_project_memory(store.workspace, state.project_id)
+            latest_memory = latest_project.memory
+            if state.invalidated_evidence_ids:
+                invalidated = set(state.invalidated_evidence_ids)
+                latest_memory = latest_memory.model_copy(
+                    update={
+                        "evidence_ids": [
+                            evidence_id
+                            for evidence_id in latest_memory.evidence_ids
+                            if evidence_id not in invalidated
+                        ]
+                    }
+                )
+            memory = merge_project_memory(state.memory, latest_memory)
+            memory = merge_project_memory(memory, answer.memory_patch)
+            project = persist_project_memory(
+                store.workspace,
+                project_id=state.project_id,
+                memory=memory,
+            )
             session = persist_session(
                 store.workspace,
                 session_id=state.session_id,
+                project_id=state.project_id,
                 new_messages=state.messages[state.turn_start_message_index :],
                 expected_message_count=state.session_message_count,
-                memory=memory,
+                memory=project.memory,
                 read_resources=session_resources,
             )
         except Exception as exc:
-            raise RetryableNodeError(f"QA session persistence failed: {exc}") from exc
+            raise RetryableNodeError(f"QA memory persistence failed: {exc}") from exc
         if session.summary != state.history_summary:
             _event(
                 store,
@@ -391,6 +443,7 @@ def build_qa_graph(
             "run_id": state.run_id,
             "thread_id": state.thread_id,
             "session_id": state.session_id,
+            "project_id": state.project_id,
             "answer": answer.answer,
             "claims": [claim.model_dump(mode="json") for claim in answer.claims],
             "cited_evidence_ids": answer.cited_evidence_ids,
@@ -423,6 +476,7 @@ def build_qa_graph(
             "run_id": state.run_id,
             "thread_id": state.thread_id,
             "session_id": state.session_id,
+            "project_id": state.project_id,
             "error": error,
             "read_budget": state.read_budget.model_dump(mode="json"),
         }
@@ -498,6 +552,7 @@ def _interrupted_qa_outcome(
         "run_id": paused.run_id,
         "thread_id": paused.thread_id,
         "session_id": paused.session_id,
+        "project_id": paused.project_id,
         "next_nodes": next_nodes,
         "retryable": True,
         "read_budget": paused.read_budget.model_dump(mode="json"),
@@ -529,13 +584,21 @@ def run_qa(
     session_id: str,
     llm_mode: str = "mock",
     *,
+    project_id: str = "default",
     provider: Any | None = None,
     read_budget: ReadBudget | None = None,
     interrupt_before: list[str] | None = None,
 ) -> dict[str, Any]:
     store = FileSystemStore(workspace)
     selected_provider = provider or _provider(llm_mode)
-    state = _new_state(store, question, session_id, llm_mode, read_budget)
+    state = _new_state(
+        store,
+        question,
+        session_id,
+        project_id,
+        llm_mode,
+        read_budget,
+    )
     try:
         with GraphRuntime.open(store.workspace) as runtime:
             graph = build_qa_graph(
@@ -561,6 +624,7 @@ def run_qa(
             "run_id": state.run_id,
             "thread_id": state.thread_id,
             "session_id": session_id,
+            "project_id": project_id,
             "error": str(exc),
             "read_budget": state.read_budget.model_dump(mode="json"),
         }

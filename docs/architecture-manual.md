@@ -12,7 +12,7 @@ PaperScout 是一个本地、单用户、单进程、文件系统优先的论文
 - `wiki/` 是可重建发布层；旧 Wiki 不做兼容迁移，可从保留的 raw 重新生成。
 - `runs/` 是单次运行的审计层，保存事件、结果、模型原始输出和失败信息。
 - `runtime/checkpoints.sqlite` 是 LangGraph 执行位置的持久化层；它与用户可读 Session、审计事件是不同契约。
-- Ingest、基础 QA Agent Loop、Checkpoint 中断续跑、用户可读 Session 文件、最近四轮压缩和资源哈希失效重读已具备可运行实现；项目级长期记忆和 Answer Review 尚未完成。
+- Ingest、基础 QA Agent Loop、Checkpoint 中断续跑、用户可读 Session 文件、最近四轮压缩、资源哈希失效重读和文件型项目级长期记忆已具备可运行实现；动态 token 压缩、全局用户 Profile 和 Answer Review 尚未完成。
 - Ingest 与 QA 都由真正的 LangGraph `StateGraph` 编排；显式节点边界中断和瞬时模型/工具故障会保留可恢复 Checkpoint，并由对应 `resume_*` API 继续。
 
 ## 2. 当前组件与数据流
@@ -104,6 +104,8 @@ workspace/
 ├── runtime/
 │   └── checkpoints.sqlite
 └── memory/
+    ├── projects/{project_id}/
+    │   └── state.json
     └── sessions/{session_id}/
         ├── messages.jsonl
         ├── state.json
@@ -117,7 +119,7 @@ workspace/
 - `papers/{paper_id}.md` 固定为“研究问题、核心思路、方法、实验概况、结论与局限”五栏。
 - `events.jsonl` 是审计事件，不是恢复 Checkpoint；当前不再生成自定义 `runs/{run_id}/state.json`。
 - 每次 Ingest 和 QA 都通过 `GraphRuntime` 运行，并将 JSON 原生 Graph State 保存到 `checkpoints.sqlite`；`resume_ingest()` 与 `resume_qa()` 使用返回的 `thread_id` 在新 runtime 中续跑。
-- 完成的 QA 轮次把完整消息审计原子写入 `messages.jsonl`，把不含消息和工具正文的记忆/资源状态写入 `state.json`，并以 `summary.md` 保存当前摘要投影；同一 `session_id` 的下一轮会加载这些文件。
+- 完成的 QA 轮次把项目级结构化记忆原子写入 `memory/projects/{project_id}/state.json`；完整消息审计、Session 记忆/资源状态和摘要投影仍分别写入 Session 三文件。相同 `project_id` 的不同 Session 共享项目记忆，但不共享消息或已读资源正文。
 
 ## 4. 运行时契约
 
@@ -145,9 +147,11 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 `session.py` 校验 `session_id` 只能映射到工作区内的单个安全目录，并严格加载完整的三文件集合。加载已有 Session 时，宿主通过与读取工具相同的允许根目录和目录哈希语义重新计算每个资源的 SHA256；已变化、缺失或不再位于允许范围的记录从本轮状态移除，只由失效记录支撑的 Evidence ID 同步从记忆中移除。最近历史中的对应工具正文会替换为 `STALE_SESSION_RESOURCE`，完整 `messages.jsonl` 审计保持不变，模型提示必须重新读取。
 
-完成节点会把 `SessionMessage` 全量审计写入 `messages.jsonl`，合并经本轮 Evidence 校验的 `ProjectMemory`，累积去重后的有效 `ReadResourceRecord`，再将不含 `messages` 字段的 `SessionState` 写入 `state.json`。`state.json` 不保存消息或工具正文。Session 写入异常保留在 `complete_qa` 之前的 Checkpoint，已写入的消息通过 message ID 幂等重放，恢复时不会重复消息或模型调用。
+`project_memory.py` 对 `project_id` 使用与 Session 相同的安全单路径分量约束；`run_qa()` 的可选关键字参数默认为 `default`。项目状态只保存严格的 `ProjectState` 和结构化 `ProjectMemory`，不保存消息、已读资源或工具正文。同一项目下的新 Session 会加载长期记忆；Session 首次写入后绑定其 `project_id`，后续不能切换项目。项目记忆写后故障保留在 `complete_qa` 之前的 Checkpoint，重复合并与写入是幂等的。
 
-模型上下文只加载最近四个已完成交互轮次和当前问题。更早轮次被确定性压缩到结构化 `summary.md`：保留项目记忆、有效资源的路径、offset、字符数、SHA256、Evidence ID，以及每个旧轮次的精简用户问题和最终回答；旧工具正文仍完整留在 `messages.jsonl`，但不会回流模型。摘要最多列出最近 20 个已压缩轮次，更老轮次只保留在完整审计中。压缩会记录 `context.compacted` 事件。当前采用固定四轮边界，尚未实现按真实模型 token 窗口约 60% 动态触发和项目级长期记忆文件。
+完成节点会先把经本轮 Evidence 校验的记忆合并到最新项目状态，再把 `SessionMessage` 全量审计写入 `messages.jsonl`，累积去重后的有效 `ReadResourceRecord`，并将不含 `messages` 字段的 `SessionState` 写入 `state.json`。`state.json` 不保存消息或工具正文。Session 写入异常同样保留在 `complete_qa` 之前的 Checkpoint，已写入的消息通过 message ID 幂等重放，恢复时不会重复消息或模型调用。
+
+模型上下文加载当前项目长期记忆、Session 摘要、最近四个已完成交互轮次和当前问题。更早轮次被确定性压缩到结构化 `summary.md`：保留项目记忆、有效资源的路径、offset、字符数、SHA256、Evidence ID，以及每个旧轮次的精简用户问题和最终回答；旧工具正文仍完整留在 `messages.jsonl`，但不会回流模型。摘要最多列出最近 20 个已压缩轮次，更老轮次只保留在完整审计中。压缩会记录 `context.compacted` 事件。当前采用固定四轮边界，尚未实现按真实模型 token 窗口约 60% 动态触发和全局用户 Profile 文件。
 
 ### 4.6 事件
 
@@ -176,12 +180,12 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 ### 5.2 QA
 
-1. `run_qa()` 校验并加载同一 `session_id` 的用户可读 Session，建立独立运行与 `thread_id`，将结构化摘要、最近四轮、记忆和当前用户问题写入 `QAGraphState` 并启动 Checkpointed `StateGraph`。
+1. `run_qa()` 校验 `project_id` 与 `session_id`，加载项目长期记忆和绑定同一项目的用户可读 Session，建立独立运行与 `thread_id`，将项目 ID、结构化摘要、最近四轮、合并记忆和当前用户问题写入 `QAGraphState` 并启动 Checkpointed `StateGraph`。
 2. `qa_agent` 调用模型并严格解析单个 JSON 对象；合法动作只能是一次 `read_project_file` 调用或最终结构化回答。
 3. `read_project_file` 执行 Schema、路径与预算校验，把完整结果写入 `runs/{run_id}/tools/`，只把精简结果回填模型。
 4. 工具错误可回到 `qa_agent` 修正；工具成功会更新预算、已读资源和可用 Evidence，再由模型决定是否继续读取。
 5. `validate_answer` 检查 Claim 类型、论文/Evidence 归属、跨论文覆盖、正文标记、引用汇总以及引用是否真正出现在本轮工具结果中。
-6. 合法答案先原子保存完整消息日志、合并后的记忆和资源元数据；超过四轮时重建结构化摘要并记录压缩事件，再写入运行结果并结束。非法 JSON、未知工具、本轮重复调用 ID、伪造引用或模型步数耗尽进入统一失败终态。
+6. 合法答案先把 `memory_patch` 幂等合并到最新项目记忆，再原子保存完整 Session 消息日志、合并后的记忆和资源元数据；超过四轮时重建结构化摘要并记录压缩事件，再写入运行结果并结束。非法 JSON、未知工具、本轮重复调用 ID、伪造引用或模型步数耗尽进入统一失败终态。
 7. 节点边界中断或瞬时模型/工具故障返回可恢复状态；`resume_qa()` 复用持久化模型/工具结果，并保证读取预算不会重复计费。
 
 ## 6. 每个代码与工程文件的作用
@@ -199,8 +203,9 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `src/paperscout/llm.py` | LLM 适配层：从环境读取设置、确定性 `MockLLM`、OpenAI-compatible Responses 客户端。 | Mock 覆盖 Ingest、Wiki Review 和基础 QA 循环；真实语义质量未验证。 |
 | `src/paperscout/review.py` | 严格解析 Review 第一行状态，并把自然语言意见转换为 `ReviewDecision`。 | Wiki Review 已接入；Answer Review 后续复用同一机制。 |
 | `src/paperscout/read_tool.py` | 实现 QA 唯一宿主只读工具：Schema、允许根目录、路径穿越/符号链接防护、文件类型、文本截断、资源哈希、读取预算和精简模型可见结果。 | 已接入 QA Graph；越界 Windows reparse point 已通过 junction 回退实测。 |
-| `src/paperscout/session.py` | 校验 Session 路径，严格加载/原子保存三文件契约，合并项目记忆与已读资源元数据，失效陈旧资源，切分轮次并构造无旧工具正文的结构化摘要。 | 用户可读文件、多轮继续、固定最近四轮压缩和资源哈希失效已接入；动态 token 阈值和项目级记忆尚未实现。 |
-| `src/paperscout/qa.py` | 定义并运行 QA `StateGraph`：严格 JSON 模型动作、工具循环、审计、预算、结构化回答、Evidence 校验、Session 多轮继续、上下文压缩、资源失效提示和 `resume_qa()`。 | P0-C2/P0-D1 与 P0-D2 Session、固定四轮压缩、资源哈希失效切片已完成；Answer Review 后续实现。 |
+| `src/paperscout/project_memory.py` | 校验项目记忆路径，严格加载并原子保存 `memory/projects/{project_id}/state.json`。 | 可选 `project_id="default"`、跨 Session 共享、项目隔离和写后故障幂等恢复已接入；全局用户 Profile 尚未实现。 |
+| `src/paperscout/session.py` | 校验 Session 路径与项目绑定，严格加载/原子保存三文件契约，合并记忆与已读资源元数据，失效陈旧资源，切分轮次并构造无旧工具正文的结构化摘要。 | 用户可读文件、多轮继续、固定最近四轮压缩、资源哈希失效和项目绑定已接入；动态 token 阈值尚未实现。 |
+| `src/paperscout/qa.py` | 定义并运行 QA `StateGraph`：严格 JSON 模型动作、工具循环、审计、预算、结构化回答、Evidence 校验、项目/Session 记忆、多轮继续、上下文压缩、资源失效提示和 `resume_qa()`。 | P0-C2/P0-D1 与 P0-D2 Session、固定四轮压缩、资源哈希失效、项目级记忆切片已完成；Answer Review 后续实现。 |
 | `src/paperscout/wiki.py` | 渲染模型输入、解析/校验五栏候选、生成论文 Wiki、读写 section evidence、更新规范索引。 | 不含旧 chunks/claims/concepts 或迁移兼容逻辑。 |
 | `src/paperscout/health.py` | 对 staging Wiki 执行确定性结构/引用规则并生成健康报告。 | 不是语义 Review Agent。 |
 | `src/paperscout/storage.py` | 文件系统路径、原子文本/JSON 写入、目录哈希、严格事件追加、staging 重建、带清单校验与崩溃窗口恢复的原子发布、结果写入和安全复制。 | Checkpoint 不存于此；旧自定义运行状态文件已删除。 |
@@ -216,7 +221,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `tests/test_ingest_from_raw.py` | 验证 raw→Wiki 闭环、失败不发布、节点中断/瞬时故障恢复、模型与 Review 持久化重放、残缺 staging 重建以及原子发布崩溃窗口/篡改回滚。 | 是。 |
 | `tests/test_review_contract.py` | 验证严格 verdict 第一行解析及未知、缺失或错位状态全部失败关闭。 | 是。 |
 | `tests/test_read_project_file.py` | 验证文本/目录读取、offset/截断、预算、路径范围、资源元数据、Schema 和结构化错误；符号链接不可用时以 Windows junction 实测越界 reparse point。 | 是。 |
-| `tests/test_qa_graph.py` | 验证精简工具结果、严格模型 JSON、渐进读取、引用失败关闭、节点中断/瞬时故障恢复、模型/工具持久化重放、预算不重复计费、终态幂等 resume、Session 三文件、多轮继续、路径保护、写后故障幂等恢复、固定四轮压缩和资源哈希失效重读。 | 是。 |
+| `tests/test_qa_graph.py` | 验证精简工具结果、严格模型 JSON、渐进读取、引用失败关闭、节点中断/瞬时故障恢复、模型/工具持久化重放、预算不重复计费、终态幂等 resume、Session 三文件、多轮继续、路径保护、写后故障幂等恢复、固定四轮压缩、资源哈希失效重读，以及项目记忆共享/隔离/恢复。 | 是。 |
 | `tests/fixtures/mineru_micro/content_list.json` | 最小确定性 MinerU fixture，覆盖二级章节和 Evidence 构造。 | 被自动测试读取。 |
 | `tests/manual_raw_to_wiki.py` | 使用本机已有 raw 手动运行真实或 Mock Ingest。 | 否，需人工调用。 |
 | `tests/manual_mineru_raw.py` | 手动调用 MinerU API，把本地 PDF 解析并导入 raw。 | 否；含本机示例路径，需按环境修改。 |
@@ -249,7 +254,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 当前最大架构缺口集中在记忆有效性和答案审核：
 
-1. 实现文件型长期项目记忆和动态 token 压缩阈值；
+1. 实现全局用户 Profile 和动态 token 压缩阈值；
 2. 增加 Answer Review；
 3. 补齐完整事件流、回放和真实模型评测。
 
@@ -263,4 +268,4 @@ uv --no-cache lock --check
 git diff --check
 ```
 
-离线 pytest 证明当前自动测试覆盖的行为没有回归，但 Mock QA/Review 只验证控制流和契约，不能证明真实问答或语义审核质量；也不能证明尚未实现的动态 token 预算、项目级长期记忆或 Answer Review 已完成。真实 MinerU/LLM 只通过对应人工脚本单独验证，不能混入离线基线结论。
+离线 pytest 证明当前自动测试覆盖的行为没有回归，但 Mock QA/Review 只验证控制流和契约，不能证明真实问答或语义审核质量；也不能证明尚未实现的动态 token 预算、全局用户 Profile 或 Answer Review 已完成。真实 MinerU/LLM 只通过对应人工脚本单独验证，不能混入离线基线结论。

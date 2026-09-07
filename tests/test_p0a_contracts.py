@@ -12,6 +12,7 @@ from paperscout.models import (
     AgentKind,
     EventKind,
     IngestGraphState,
+    ProjectState,
     QAGraphState,
     SessionState,
     WikiCandidate,
@@ -56,7 +57,10 @@ def test_wiki_candidate_requires_canonical_order_and_input_owned_evidence() -> N
 
 def test_session_and_graph_states_are_strict_contracts(tmp_path: Path) -> None:
     session = SessionState(session_id="session-1")
+    project = ProjectState(project_id="default")
+    assert session.project_id == "default"
     assert session.memory.evidence_ids == []
+    assert project.memory.evidence_ids == []
     ingest = IngestGraphState(
         run_id="run-1",
         thread_id="ingest:run-1",
@@ -72,9 +76,12 @@ def test_session_and_graph_states_are_strict_contracts(tmp_path: Path) -> None:
         question="What is the method?",
     )
     assert ingest.published is False
+    assert qa.project_id == "default"
     assert qa.read_budget.calls_used == 0
     with pytest.raises(ValidationError):
         SessionState.model_validate({"session_id": "session-1", "unknown": True})
+    with pytest.raises(ValidationError):
+        ProjectState.model_validate({"project_id": "default", "unknown": True})
 
 
 def test_event_contract_requires_correlation_and_known_event_type() -> None:
