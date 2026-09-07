@@ -1,11 +1,11 @@
 # PaperScout
 
-PaperScout 是一个基于文件系统的学术论文知识流水线。它接收论文 PDF 和 MinerU 解析结果，将原始资料保存到不可变的 `raw/` 层，生成可审阅的 `wiki/` 知识库，并支持基于证据引用的问答。
+PaperScout 是一个基于文件系统的学术论文知识流水线。它接收论文 PDF 和 MinerU 解析结果，将原始资料保存到不可变的 `raw/` 层，并生成可审阅的 `wiki/` 知识库。基于证据引用的 QA 正在按 LangGraph 重构计划开发，当前尚无可运行 QA Graph。
 
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 包含 Wiki Ingest 与 Retrieval QA 两个 Agent 流程；发布与引用检查由宿主确定性执行。
+- 当前包含可运行的 Wiki Ingest 流程；Retrieval QA、Session、语义 Review 和实际 LangGraph 图仍在开发。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
@@ -13,6 +13,8 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 - 测试默认使用确定性的 Mock LLM。
 - 提供 OpenAI 兼容 Responses 接口适配器，但当前测试不会调用真实 LLM。
 - 暂无命令行接口，Python API 是当前主要集成入口。
+
+当前逐文件架构与真实完成边界见 [架构手册](docs/architecture-manual.md)，阶段状态和验证证据见 [重构进度台账](docs/refactor-progress.md)。
 
 ## 安装与测试
 
@@ -148,6 +150,7 @@ llmwiki/
 │   └── checkpoints.sqlite
 └── runs/
     └── {run_id}/
-        ├── state.json
-        └── events.jsonl
+        ├── events.jsonl
+        ├── result.json
+        └── staging/wiki/
 ```
