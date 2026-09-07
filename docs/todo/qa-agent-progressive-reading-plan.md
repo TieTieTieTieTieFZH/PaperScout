@@ -117,6 +117,23 @@ read_project_file
 
 ### 4.1 输入
 
+模型请求工具时使用严格动作外壳：
+
+```json
+{
+  "type": "tool_call",
+  "id": "call-001",
+  "name": "read_project_file",
+  "arguments": {
+    "path": "wiki/papers/8272.md",
+    "offset_chars": 0,
+    "max_chars": 20000
+  }
+}
+```
+
+不得附加代码围栏、解释文字、第二个动作或未知字段。`arguments` 的内容为：
+
 ```json
 {
   "path": "wiki/papers/8272.md",
@@ -163,7 +180,7 @@ JSON Schema：
 | 图片 | 返回图片资源、路径和元数据 |
 | 不支持的文件 | 返回结构化错误 |
 
-文本返回格式：
+宿主内部保留完整结果，用于预算、Checkpoint 和审计，例如：
 
 ```json
 {
@@ -177,7 +194,34 @@ JSON Schema：
 }
 ```
 
-当前统一工具结果还包含 `kind`、`returned_chars`、`media_type`、结构化目录 `entries`，以及失败时的 `error_code` 和 `error`。文本与目录的 `content` 可按 `offset_chars` 和预算截断；为避免绕过预算，目录内容发生截断时不返回完整 `entries`。PDF 和图片只返回资源路径、类型与 SHA256，`content` 始终为空。
+完整内部结果还包含 `kind`、`returned_chars`、`media_type`、结构化目录 `entries`，以及失败时的 `error_code` 和 `error`。SHA256、实际字符数、预算余额、规范化路径和路径安全细节只由宿主保存，不直接暴露给模型。
+
+QA 模型只看到“精简 JSON 外壳 + 自然语言正文”。文本读取格式为：
+
+```json
+{
+  "ok": true,
+  "path": "wiki/papers/8272.md",
+  "content": "这里是文件的自然语言内容……",
+  "truncated": true,
+  "next_offset": 20000,
+  "evidence_ids": ["8272:s0064"]
+}
+```
+
+完整读取时 `next_offset` 为 `null`。失败只返回稳定错误代码和可读说明：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "PATH_OUTSIDE_ALLOWED_ROOTS",
+    "message": "path must remain inside wiki/ or raw/papers/"
+  }
+}
+```
+
+完整目录返回可直接再次读取的项目相对路径列表；目录发生截断时改为带 `content`、`truncated` 和 `next_offset` 的分页结果，避免泄露预算外条目。PDF 和图片只向模型返回路径、资源类型和媒体类型，不返回二进制或 SHA256。
 
 调用预算规则：未通过 JSON Schema 的参数不进入有效工具调用，也不消耗预算；通过 Schema 后的调用会消耗一次调用额度，即使随后因路径或文件类型失败。成功返回的文本字符计入累计字符预算；剩余额度小于请求长度时只返回剩余预算内的内容并标记 `truncated: true`。
 
@@ -292,6 +336,7 @@ QA 最终生成结构化回答：
 
 ```json
 {
+  "type": "final",
   "answer": "面向用户的 Markdown 回答",
   "claims": [
     {
@@ -310,7 +355,12 @@ QA 最终生成结构化回答：
   "cited_evidence_ids": ["8272:s0064"],
   "status": "answered",
   "memory_patch": {
-    "current_topic": "个性引导的视觉建模"
+    "research_goal": null,
+    "paper_aliases": {},
+    "confirmed_decisions": [],
+    "unresolved_questions": [],
+    "research_hypotheses": [],
+    "evidence_ids": ["8272:s0064"]
   }
 }
 ```
@@ -350,30 +400,32 @@ memory/sessions/{session_id}/
 
 ### 8.2 工作状态
 
-`state.json` 保存：
+`state.json` 保存用户可读 Session 状态；完整工具正文仍只在消息审计中出现，不写入长期记忆：
 
 ```json
 {
-  "research_goal": "了解显著性预测方法",
-  "selected_papers": ["8272", "paper-2"],
-  "paper_aliases": {
-    "第一篇论文": "8272"
+  "session_id": "session-1",
+  "summary": "用户正在比较个性引导的视觉建模方法。",
+  "memory": {
+    "research_goal": "了解显著性预测方法",
+    "paper_aliases": {
+      "第一篇论文": "8272"
+    },
+    "confirmed_decisions": [],
+    "unresolved_questions": [
+      "该方法能否迁移到其他条件引导任务"
+    ],
+    "research_hypotheses": [
+      "使用其他条件信息替换个性特征"
+    ],
+    "evidence_ids": ["8272:s0064"]
   },
-  "loaded_resources": [
+  "read_resources": [
     {
-      "path": "wiki/papers/8272.md",
-      "sha256": "..."
-    }
-  ],
-  "loaded_evidence": ["8272:s0064"],
-  "current_topic": "个性引导的多模态交互",
-  "open_questions": [
-    "该方法能否迁移到其他条件引导任务"
-  ],
-  "candidate_ideas": [
-    {
-      "text": "使用其他条件信息替换个性特征",
-      "status": "hypothesis",
+      "path": "wiki/evidence/8272/s0064.md",
+      "offset_chars": 0,
+      "returned_chars": 8234,
+      "sha256": "...",
       "evidence_ids": ["8272:s0064"]
     }
   ]

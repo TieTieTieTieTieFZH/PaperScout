@@ -31,7 +31,8 @@ IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
     ".webp": "image/webp",
 }
-EVIDENCE_ID = re.compile(r"\[?evidence:([^\]\s|]+)")
+EVIDENCE_MARK = re.compile(r"\[?evidence:([^\]\s|]+)")
+EVIDENCE_FIELD = re.compile(r"Evidence ID:\s*`([^`\s]+)`")
 
 
 def _error(
@@ -98,6 +99,44 @@ def _directory_content(directory: Path, workspace: Path) -> tuple[str, list[Proj
             )
         )
     return "\n".join(names), entries
+
+
+def model_visible_read_result(outcome: ReadProjectFileOutcome) -> dict[str, Any]:
+    """Return the small deterministic envelope shown to the QA model."""
+    result = outcome.result
+    if result.status == "error":
+        return {
+            "ok": False,
+            "error": {
+                "code": result.error_code,
+                "message": result.error,
+            },
+        }
+    if result.kind == "directory" and result.entries:
+        return {
+            "ok": True,
+            "path": result.path,
+            "entries": [entry.path for entry in result.entries],
+            "truncated": result.truncated,
+            "next_offset": result.next_offset_chars if result.truncated else None,
+        }
+    if result.kind in {"text", "directory"}:
+        return {
+            "ok": True,
+            "path": result.path,
+            "content": result.content,
+            "truncated": result.truncated,
+            "next_offset": result.next_offset_chars if result.truncated else None,
+            "evidence_ids": outcome.record.evidence_ids if outcome.record else [],
+        }
+    return {
+        "ok": True,
+        "path": result.path,
+        "resource": {
+            "kind": result.kind,
+            "media_type": result.media_type,
+        },
+    }
 
 
 def read_project_file(
@@ -234,7 +273,7 @@ def read_project_file(
         media_type=media_type,
     )
     updated_budget = called_budget.model_copy(update={"chars_used": budget.chars_used + len(content)})
-    evidence_ids = sorted(set(EVIDENCE_ID.findall(content)))
+    evidence_ids = sorted(set(EVIDENCE_MARK.findall(content)) | set(EVIDENCE_FIELD.findall(content)))
     record = ReadResourceRecord(
         path=normalized_path,
         offset_chars=parsed.offset_chars,

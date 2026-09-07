@@ -1,12 +1,12 @@
 # PaperScout
 
-PaperScout 是一个基于文件系统的学术论文知识流水线。它接收论文 PDF 和 MinerU 解析结果，将原始资料保存到不可变的 `raw/` 层，并生成可审阅的 `wiki/` 知识库。基于证据引用的 QA 正在按 LangGraph 重构计划开发，当前尚无可运行 QA Graph。
+PaperScout 是一个基于文件系统的学术论文知识流水线。它接收论文 PDF 和 MinerU 解析结果，将原始资料保存到不可变的 `raw/` 层，生成可审阅的 `wiki/` 知识库，并通过受控只读 QA Agent 渐进读取资料、返回带 Evidence 的结构化回答。
 
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 已由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer，包含确定性规则与独立 Wiki Review Chat Client；Retrieval QA、Session、Answer Review 和中断恢复仍在开发。
-- 已实现 QA 将使用的宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；目前尚未接入 QA Agent Loop。
+- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；Session、上下文压缩、Answer Review 和中断恢复仍在开发。
+- QA 只使用宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；模型只看到精简 JSON 外壳与自然语言正文，哈希和完整预算信息保留在宿主审计中。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
   - 不传入 `mineru_path`：上传 `source_pdf` 到 MinerU 精准解析 API，轮询任务并导入返回的 ZIP 结果。
@@ -73,6 +73,23 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 宿主只使用当前论文的 `mineru/content_list.json`，按 `type: text`、`text_level: 2` 聚合 section evidence。Evidence ID 使用二级标题在原始数组中的下标，例如 `<paper_id>:s0042`。Ingest 是无工具 Chat Client；输入必须一次性完整装入预算，若简单前缀会发生截断则失败关闭，在失败结果和 Checkpoint 中记录结构化覆盖信息，不生成不完整 Wiki。
 
 ## Python API
+
+### 使用 QA Agent 渐进读取项目资料
+
+```python
+from pathlib import Path
+from paperscout import run_qa
+
+result = run_qa(
+    workspace=Path("./paper-workspace"),
+    question="这些论文的方法有什么共同点？",
+    session_id="research-session-1",
+    llm_mode="mock",
+)
+print(result["answer"])
+```
+
+QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、重复调用 ID 或未读 Evidence 引用会失败关闭。当前 `session_id` 用于运行关联，用户可读 Session 文件、跨轮记忆和中断后续跑尚未实现。`mock` 只验证确定性控制流；真实问答质量需要使用 `real` 单独人工评测。
 
 ### 使用本地 MinerU 结果
 

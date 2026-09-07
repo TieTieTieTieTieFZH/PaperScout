@@ -275,6 +275,84 @@ class ProjectMemory(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+class QAClaimType(str, Enum):
+    PAPER_FACT = "paper_fact"
+    CROSS_PAPER_SYNTHESIS = "cross_paper_synthesis"
+    HYPOTHESIS = "hypothesis"
+
+
+class QAAnswerStatus(str, Enum):
+    ANSWERED = "answered"
+    PARTIALLY_ANSWERED = "partially_answered"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class QAClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1)
+    type: QAClaimType
+    paper_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_evidence_ownership(self) -> "QAClaim":
+        if len(self.paper_ids) != len(set(self.paper_ids)):
+            raise ValueError("claim paper_ids must be unique")
+        if len(self.evidence_ids) != len(set(self.evidence_ids)):
+            raise ValueError("claim evidence_ids must be unique")
+        if self.type == QAClaimType.PAPER_FACT and (not self.paper_ids or not self.evidence_ids):
+            raise ValueError("paper facts require paper_ids and evidence_ids")
+        if self.type == QAClaimType.CROSS_PAPER_SYNTHESIS and len(self.paper_ids) < 2:
+            raise ValueError("cross-paper synthesis requires at least two papers")
+        for evidence_id in self.evidence_ids:
+            if not any(evidence_id.startswith(f"{paper_id}:s") for paper_id in self.paper_ids):
+                raise ValueError(f"evidence {evidence_id} does not belong to a claim paper")
+        if self.type in {QAClaimType.PAPER_FACT, QAClaimType.CROSS_PAPER_SYNTHESIS}:
+            missing = [
+                paper_id
+                for paper_id in self.paper_ids
+                if not any(evidence_id.startswith(f"{paper_id}:s") for evidence_id in self.evidence_ids)
+            ]
+            if missing:
+                raise ValueError(f"claim papers lack evidence: {missing}")
+        return self
+
+
+class QAAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(min_length=1)
+    claims: list[QAClaim] = Field(default_factory=list)
+    cited_evidence_ids: list[str] = Field(default_factory=list)
+    status: QAAnswerStatus
+    memory_patch: ProjectMemory = Field(default_factory=ProjectMemory)
+
+    @model_validator(mode="after")
+    def validate_citation_index(self) -> "QAAnswer":
+        if len(self.cited_evidence_ids) != len(set(self.cited_evidence_ids)):
+            raise ValueError("cited_evidence_ids must be unique")
+        claimed = {evidence_id for claim in self.claims for evidence_id in claim.evidence_ids}
+        if set(self.cited_evidence_ids) != claimed:
+            raise ValueError("cited_evidence_ids must exactly index claim evidence")
+        if self.status == QAAnswerStatus.INSUFFICIENT_EVIDENCE and self.claims:
+            raise ValueError("insufficient_evidence answers must not contain factual claims")
+        return self
+
+
+class QAToolCallEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["tool_call"]
+    id: str = Field(min_length=1)
+    name: Literal["read_project_file"]
+    arguments: dict[str, Any]
+
+
+class QAFinalEnvelope(QAAnswer):
+    type: Literal["final"]
+
+
 class SessionState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -340,17 +418,22 @@ class QAGraphState(BaseModel):
     workspace: str = Field(min_length=1)
     question: str = Field(min_length=1)
     status: RunStatus = RunStatus.PENDING
+    current_node: str | None = None
+    event_sequence: int = Field(default=0, ge=0)
     messages: list[SessionMessage] = Field(default_factory=list)
     history_summary: str = ""
     memory: ProjectMemory = Field(default_factory=ProjectMemory)
     read_resources: list[ReadResourceRecord] = Field(default_factory=list)
     read_budget: ReadBudget = Field(default_factory=ReadBudget)
     current_tool_calls: list[AgentToolCall] = Field(default_factory=list)
-    candidate_answer: str | None = None
+    candidate_answer: QAAnswer | None = None
     review: ReviewDecision | None = None
     attempt: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)
+    model_steps: int = Field(default=0, ge=0)
+    max_model_steps: int = Field(default=32, ge=1)
     last_error: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class AgentKind(str, Enum):
