@@ -162,6 +162,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `pyproject.toml` | Python 包元数据、运行依赖、开发依赖、构建后端与 pytest 配置。 |
 | `uv.lock` | 锁定全部直接和传递依赖，保证 `uv sync --frozen` 可复现。 |
 | `.github/workflows/ci.yml` | Windows CI；对 main push 和 PR 执行冻结依赖同步及完整离线 pytest。 |
+| `AGENTS.md` | 仓库级 Agent 开发约束：规定文档阅读顺序、测试先行、进度更新、系统边界和遇到歧义先询问用户。 |
 | `README.md` | 面向使用者的能力概览、配置、Python API 和工作区布局。 |
 | `docs/paperscout-architecture.md` | 较短的设计概览；部分章节描述目标态，详细当前态以本手册为准。 |
 | `docs/architecture-manual.md` | 当前文件；面向维护者的逐模块架构与真实完成边界。 |
