@@ -471,11 +471,12 @@ class QAGraphState(BaseModel):
     turn_start_message_index: int = Field(default=0, ge=0)
     current_tool_calls: list[AgentToolCall] = Field(default_factory=list)
     candidate_answer: QAAnswer | None = None
+    safe_fallback: bool = False
     rule_review: ReviewDecision | None = None
     answer_evidence_hashes: dict[str, str] = Field(default_factory=dict)
     review: ReviewDecision | None = None
     attempt: int = Field(default=0, ge=0)
-    max_attempts: int = Field(default=2, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
     model_steps: int = Field(default=0, ge=0)
     max_model_steps: int = Field(default=32, ge=1)
     last_error: str | None = None

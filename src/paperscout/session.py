@@ -120,6 +120,31 @@ def session_turns(messages: list[SessionMessage]) -> list[list[SessionMessage]]:
     return turns
 
 
+def session_model_context(messages: list[SessionMessage]) -> list[SessionMessage]:
+    """Project full audit turns into model history without rejected answer drafts."""
+    projected: list[SessionMessage] = []
+    for turn in session_turns(messages):
+        final_indexes = [
+            index
+            for index, message in enumerate(turn)
+            if message.role == "assistant"
+            and isinstance(message.content, dict)
+            and message.content.get("type") == "final"
+        ]
+        final_index = final_indexes[-1] if final_indexes else None
+        for index, message in enumerate(turn):
+            if (
+                message.role == "system"
+                and isinstance(message.content, dict)
+                and message.content.get("type") == "answer_review"
+            ):
+                continue
+            if index in final_indexes and index != final_index:
+                continue
+            projected.append(message)
+    return projected
+
+
 def recent_session_messages(
     messages: list[SessionMessage],
     *,

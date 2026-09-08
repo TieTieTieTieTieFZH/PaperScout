@@ -49,6 +49,7 @@ from .session import (
     merge_read_resources,
     persist_session,
     invalidate_stale_session_resources,
+    session_model_context,
     session_turns,
 )
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
@@ -269,11 +270,12 @@ def _new_state(
         project_id=project_id,
     )
     loaded_session_memory = session.memory
-    session, context_history, invalidated_resources = invalidate_stale_session_resources(
+    session, audited_history, invalidated_resources = invalidate_stale_session_resources(
         store.workspace,
         session,
         history,
     )
+    context_history = session_model_context(audited_history)
     invalidated_evidence_ids = [
         evidence_id
         for evidence_id in loaded_session_memory.evidence_ids
@@ -444,6 +446,7 @@ def build_qa_graph(
                         ).model_dump(mode="json")
                     ],
                     "candidate_answer": None,
+                    "safe_fallback": False,
                     "rule_review": None,
                     "answer_evidence_hashes": {},
                     "review": None,
@@ -458,6 +461,7 @@ def build_qa_graph(
                 "messages": [message.model_dump(mode="json") for message in messages],
                 "current_tool_calls": [],
                 "candidate_answer": answer.model_dump(mode="json"),
+                "safe_fallback": False,
                 "rule_review": None,
                 "answer_evidence_hashes": {},
                 "review": None,
@@ -706,17 +710,29 @@ def build_qa_graph(
                 },
                 agent=AgentKind.ANSWER_REVIEW,
             )
-            error = None
-            if decision.verdict != ReviewVerdict.APPROVE:
-                error = (
-                    f"Semantic Answer Review returned {decision.verdict.value}; "
-                    "answer revision is not implemented"
-                )
+            review_message = _message(
+                "system",
+                {
+                    "type": "answer_review",
+                    "attempt": state.attempt,
+                    "verdict": decision.verdict.value,
+                    "feedback": decision.feedback,
+                    "instruction": (
+                        "This is an audit record for an approved answer; preserve the existing QA rules."
+                        if decision.verdict == ReviewVerdict.APPROVE
+                        else "Revise the complete answer under the existing QA rules; read more project material if needed."
+                    ),
+                },
+            )
             return {
                 "current_node": state.current_node,
                 "event_sequence": state.event_sequence,
+                "messages": [
+                    message.model_dump(mode="json")
+                    for message in [*state.messages, review_message]
+                ],
                 "review": decision.model_dump(mode="json"),
-                "last_error": error,
+                "last_error": None,
             }
         except RetryableNodeError:
             raise
@@ -729,12 +745,73 @@ def build_qa_graph(
                 "last_error": str(exc),
             }
 
+    def revise_answer_node(state: QAGraphState) -> dict[str, Any]:
+        state.current_node = "revise_answer"
+        try:
+            if state.review is None or state.review.verdict == ReviewVerdict.APPROVE:
+                raise RuntimeError("Cannot revise without a non-approval Answer Review verdict")
+            if state.attempt >= state.max_attempts:
+                raise RuntimeError("Answer revision attempt budget is exhausted")
+            return {
+                "current_node": state.current_node,
+                "attempt": state.attempt + 1,
+                "candidate_answer": None,
+                "safe_fallback": False,
+                "rule_review": None,
+                "answer_evidence_hashes": {},
+                "review": None,
+                "last_error": None,
+            }
+        except Exception as exc:
+            return {"current_node": state.current_node, "last_error": str(exc)}
+
+    def safe_answer_node(state: QAGraphState) -> dict[str, Any]:
+        state.current_node = "safe_answer"
+        try:
+            if state.review is None or state.review.verdict == ReviewVerdict.APPROVE:
+                raise RuntimeError("Safe fallback requires a non-approval Answer Review verdict")
+            if state.attempt < state.max_attempts:
+                raise RuntimeError("Safe fallback is only allowed after the revision budget is exhausted")
+            answer = QAAnswer(
+                answer=(
+                    "候选答案在达到最大修订次数后仍未通过 Evidence 审核；"
+                    "当前证据不足，无法提供可靠结论。"
+                ),
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+                memory_patch={},
+            )
+            envelope = {"type": "final", **answer.model_dump(mode="json")}
+            messages = [*state.messages, _message("assistant", envelope)]
+            return {
+                "current_node": state.current_node,
+                "messages": [message.model_dump(mode="json") for message in messages],
+                "candidate_answer": answer.model_dump(mode="json"),
+                "safe_fallback": True,
+                "rule_review": None,
+                "answer_evidence_hashes": {},
+                "last_error": None,
+            }
+        except Exception as exc:
+            return {"current_node": state.current_node, "last_error": str(exc)}
+
     def verify_answer_evidence_node(state: QAGraphState) -> dict[str, Any]:
         state.current_node = "verify_answer_evidence"
         try:
             if state.rule_review is None or state.rule_review.verdict != ReviewVerdict.APPROVE:
                 raise RuntimeError("Answer candidate has not passed deterministic review")
-            if state.review is None or state.review.verdict != ReviewVerdict.APPROVE:
+            safe_fallback = (
+                state.safe_fallback
+                and state.candidate_answer is not None
+                and state.candidate_answer.status.value == "insufficient_evidence"
+                and not state.candidate_answer.claims
+                and not state.candidate_answer.cited_evidence_ids
+                and not state.answer_evidence_hashes
+            )
+            if not safe_fallback and (
+                state.review is None or state.review.verdict != ReviewVerdict.APPROVE
+            ):
                 raise RuntimeError("Answer candidate has not passed semantic review")
             verify_answer_review_evidence(
                 Path(state.workspace),
@@ -797,6 +874,8 @@ def build_qa_graph(
             "memory_patch": answer.memory_patch.model_dump(mode="json"),
             "rule_review": state.rule_review.model_dump(mode="json"),
             "review": state.review.model_dump(mode="json"),
+            "review_attempts": state.attempt,
+            "safe_fallback": state.safe_fallback,
             "read_resources": [record.model_dump(mode="json") for record in state.read_resources],
             "read_budget": state.read_budget.model_dump(mode="json"),
         }
@@ -832,6 +911,8 @@ def build_qa_graph(
             result["rule_review"] = state.rule_review.model_dump(mode="json")
         if state.review is not None:
             result["review"] = state.review.model_dump(mode="json")
+        result["review_attempts"] = state.attempt
+        result["safe_fallback"] = state.safe_fallback
         _event(store, state, EventKind.RUN_FAILED, state.current_node, error, agent=AgentKind.QA)
         store.write_result(state.run_id, result)
         return {
@@ -853,11 +934,25 @@ def build_qa_graph(
     def route_error(state: QAGraphState) -> str:
         return "fail" if state.last_error else "continue"
 
+    def route_answer_rules(state: QAGraphState) -> str:
+        if state.last_error:
+            return "fail"
+        return "verify" if state.safe_fallback else "review"
+
+    def route_answer_review(state: QAGraphState) -> str:
+        if state.last_error is not None or state.review is None:
+            return "fail"
+        if state.review.verdict == ReviewVerdict.APPROVE:
+            return "approve"
+        return "revise" if state.attempt < state.max_attempts else "fallback"
+
     builder = StateGraph(QAGraphState)
     builder.add_node("qa_agent", model_node)
     builder.add_node("read_project_file", tool_node)
     builder.add_node("answer_rules", answer_rules_node)
     builder.add_node("answer_review", answer_review_node)
+    builder.add_node("revise_answer", revise_answer_node)
+    builder.add_node("safe_answer", safe_answer_node)
     builder.add_node("verify_answer_evidence", verify_answer_evidence_node)
     builder.add_node("complete_qa", complete_node)
     builder.add_node("fail_qa", fail_node)
@@ -874,13 +969,28 @@ def build_qa_graph(
     )
     builder.add_conditional_edges(
         "answer_rules",
-        route_error,
-        {"continue": "answer_review", "fail": "fail_qa"},
+        route_answer_rules,
+        {"review": "answer_review", "verify": "verify_answer_evidence", "fail": "fail_qa"},
     )
     builder.add_conditional_edges(
         "answer_review",
+        route_answer_review,
+        {
+            "approve": "verify_answer_evidence",
+            "revise": "revise_answer",
+            "fallback": "safe_answer",
+            "fail": "fail_qa",
+        },
+    )
+    builder.add_conditional_edges(
+        "revise_answer",
         route_error,
-        {"continue": "verify_answer_evidence", "fail": "fail_qa"},
+        {"continue": "qa_agent", "fail": "fail_qa"},
+    )
+    builder.add_conditional_edges(
+        "safe_answer",
+        route_error,
+        {"continue": "answer_rules", "fail": "fail_qa"},
     )
     builder.add_conditional_edges(
         "verify_answer_evidence",

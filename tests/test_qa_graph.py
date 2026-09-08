@@ -610,7 +610,16 @@ def test_completed_qa_persists_user_readable_session_without_tool_text_in_state(
         SessionMessage.model_validate_json(line)
         for line in (session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert [message.role for message in messages] == ["user", "assistant", "tool", "assistant"]
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "system",
+    ]
+    assert isinstance(messages[-1].content, dict)
+    assert messages[-1].content["type"] == "answer_review"
+    assert messages[-1].content["verdict"] == "APPROVE"
     assert "该方法使用可核查的处理流程" in json.dumps(
         messages[2].content, ensure_ascii=False
     )
@@ -699,7 +708,7 @@ def test_same_session_continues_with_history_memory_and_reused_tool_call_ids(
     state = SessionState.model_validate_json(
         (session_dir / "state.json").read_text(encoding="utf-8")
     )
-    assert len(messages) == 8
+    assert len(messages) == 10
     assert state.memory.research_goal == "核对论文方法"
     assert state.memory.paper_aliases == {"第一篇": "paper-1", "这篇论文": "paper-1"}
     assert state.memory.confirmed_decisions == ["继续核对原文"]
@@ -770,7 +779,7 @@ def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
     assert (session_dir / "state.json").is_file()
     assert (session_dir / "messages.jsonl").is_file()
     assert (session_dir / "summary.md").is_file()
-    assert len((session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+    assert len((session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()) == 3
 
 
 def test_session_context_keeps_all_history_below_dynamic_threshold(
@@ -933,7 +942,7 @@ def test_session_context_compacts_at_dynamic_threshold_and_keeps_four_turns(
     state = SessionState.model_validate_json(
         (session_dir / "state.json").read_text(encoding="utf-8")
     )
-    assert len(message_log.splitlines()) == 14
+    assert len(message_log.splitlines()) == 20
     assert old_tool_text in message_log
     assert old_tool_text not in summary
     assert "问题一" in summary
@@ -1352,7 +1361,7 @@ def test_project_memory_persistence_failure_resumes_without_repeating_model_call
         / "project-persist-session"
         / "messages.jsonl"
     ).read_text(encoding="utf-8").splitlines()
-    assert len(messages) == 2
+    assert len(messages) == 3
 
 
 def test_user_profile_is_loaded_across_projects_and_remains_read_only_for_qa(
@@ -1630,15 +1639,164 @@ def test_semantic_answer_review_invalid_verdict_fails_closed(tmp_path: Path) -> 
     assert failed["status"] == "failed"
 
 
-@pytest.mark.parametrize("verdict", ["REVISE", "REJECT"])
-def test_semantic_answer_review_non_approval_cannot_return_answer(
+def test_semantic_answer_review_revise_regenerates_and_rechecks_full_answer(
     tmp_path: Path,
-    verdict: str,
 ) -> None:
     workspace = _workspace(tmp_path)
     qa_provider = ScriptedProvider(
         [
-            _tool_call(f"answer-review-{verdict.lower()}-read", "wiki/papers/paper-1.md"),
+            _tool_call("answer-review-revise-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文方法适用于所有任务。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文方法适用于所有任务。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+            _final(
+                answer="论文记录了一个可核查的方法流程。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了一个可核查的方法流程。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+    review_provider = ScriptedProvider(
+        [
+            "VERDICT: REVISE\n\n适用范围表述过强，请缩小结论。",
+            "VERDICT: APPROVE\n\n修订后的回答得到证据支持。",
+        ]
+    )
+
+    result = run_qa(
+        workspace,
+        "方法？",
+        "semantic-answer-review-revise-session",
+        provider=qa_provider,
+        review_provider=review_provider,
+    )
+
+    assert result["status"] == "completed"
+    assert result["answer"] == "论文记录了一个可核查的方法流程。 [evidence:paper-1:s0001]"
+    assert result["review"]["verdict"] == "APPROVE"
+    assert result["review_attempts"] == 2
+    assert result["safe_fallback"] is False
+    assert len(qa_provider.requests) == 3
+    assert len(review_provider.requests) == 2
+    feedback_messages = [
+        message
+        for message in qa_provider.requests[2]
+        if message["role"] == "system"
+        and isinstance(message["content"], dict)
+        and message["content"].get("type") == "answer_review"
+    ]
+    assert feedback_messages[-1]["content"]["verdict"] == "REVISE"
+    assert "缩小结论" in feedback_messages[-1]["content"]["feedback"][0]
+    review_root = workspace / "runs" / result["run_id"] / "review" / "answer"
+    assert (review_root / "1" / "result.json").is_file()
+    assert (review_root / "2" / "result.json").is_file()
+
+
+def test_rejected_answer_drafts_remain_in_audit_but_not_next_model_context(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    rejected_text = "被拒绝的过强结论"
+    review_feedback = "该结论超出 Evidence 支持范围"
+    approved_text = "最终批准的受支持结论"
+    first = run_qa(
+        workspace,
+        "方法？",
+        "semantic-answer-review-context-session",
+        provider=ScriptedProvider(
+            [
+                _tool_call("answer-review-context-read", "wiki/papers/paper-1.md"),
+                _final(
+                    answer=f"{rejected_text}。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": f"{rejected_text}。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                ),
+                _final(
+                    answer=f"{approved_text}。 [evidence:paper-1:s0001]",
+                    claims=[
+                        {
+                            "text": f"{approved_text}。",
+                            "type": "paper_fact",
+                            "paper_ids": ["paper-1"],
+                            "evidence_ids": ["paper-1:s0001"],
+                        }
+                    ],
+                    cited_evidence_ids=["paper-1:s0001"],
+                ),
+            ]
+        ),
+        review_provider=ScriptedProvider(
+            [
+                f"VERDICT: REVISE\n\n{review_feedback}。",
+                "VERDICT: APPROVE\n\n审核通过。",
+            ]
+        ),
+    )
+    assert first["status"] == "completed"
+
+    second_provider = ScriptedProvider(
+        [
+            _final(
+                answer="当前资料不足。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+    second = run_qa(
+        workspace,
+        "还有哪些信息？",
+        "semantic-answer-review-context-session",
+        provider=second_provider,
+        review_provider=ScriptedProvider(["VERDICT: APPROVE\n\n审核通过。"]),
+    )
+
+    assert second["status"] == "completed"
+    request = json.dumps(second_provider.requests[0], ensure_ascii=False)
+    assert approved_text in request
+    assert rejected_text not in request
+    assert review_feedback not in request
+    message_log = (
+        workspace
+        / "memory"
+        / "sessions"
+        / "semantic-answer-review-context-session"
+        / "messages.jsonl"
+    ).read_text(encoding="utf-8")
+    assert approved_text in message_log
+    assert rejected_text in message_log
+    assert review_feedback in message_log
+
+
+def test_semantic_answer_review_reject_can_drive_additional_read(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call("answer-review-reject-read", "wiki/papers/paper-1.md"),
             _final(
                 answer="论文记录了方法。 [evidence:paper-1:s0001]",
                 claims=[
@@ -1651,28 +1809,98 @@ def test_semantic_answer_review_non_approval_cannot_return_answer(
                 ],
                 cited_evidence_ids=["paper-1:s0001"],
             ),
+            _tool_call(
+                "answer-review-reject-evidence",
+                "wiki/evidence/paper-1/s0001.md",
+            ),
+            _final(
+                answer="原文章节描述了方法流程。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "原文章节描述了方法流程。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+    review_provider = ScriptedProvider(
+        [
+            "VERDICT: REJECT\n\n需要读取实际章节后完整重答。",
+            "VERDICT: APPROVE\n\n重新回答得到章节支持。",
         ]
     )
 
     result = run_qa(
         workspace,
         "方法？",
-        f"semantic-answer-review-{verdict.lower()}-session",
+        "semantic-answer-review-reject-session",
         provider=qa_provider,
-        review_provider=ScriptedProvider(
-            [f"VERDICT: {verdict}\n\n回答需要进一步处理。"]
-        ),
+        review_provider=review_provider,
     )
 
-    assert result["status"] == "failed"
-    assert result["review"]["verdict"] == verdict
-    assert "answer revision is not implemented" in result["error"]
-    assert not (
-        workspace
-        / "memory"
-        / "sessions"
-        / f"semantic-answer-review-{verdict.lower()}-session"
-    ).exists()
+    assert result["status"] == "completed"
+    assert result["read_budget"]["calls_used"] == 2
+    assert result["review_attempts"] == 2
+    assert len(qa_provider.requests) == 4
+    assert len(review_provider.requests) == 2
+
+
+def test_semantic_answer_review_uses_safe_insufficient_fallback_after_two_repairs(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    candidate = _final(
+        answer="论文记录了方法。 [evidence:paper-1:s0001]",
+        claims=[
+            {
+                "text": "论文记录了方法。",
+                "type": "paper_fact",
+                "paper_ids": ["paper-1"],
+                "evidence_ids": ["paper-1:s0001"],
+            }
+        ],
+        cited_evidence_ids=["paper-1:s0001"],
+    )
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call("answer-review-fallback-read", "wiki/papers/paper-1.md"),
+            candidate,
+            candidate,
+            candidate,
+        ]
+    )
+    review_provider = ScriptedProvider(
+        [
+            "VERDICT: REVISE\n\n第一次修订。",
+            "VERDICT: REVISE\n\n第二次修订。",
+            "VERDICT: REJECT\n\n仍不能得到支持。",
+        ]
+    )
+
+    result = run_qa(
+        workspace,
+        "方法？",
+        "semantic-answer-review-fallback-session",
+        provider=qa_provider,
+        review_provider=review_provider,
+    )
+
+    assert result["status"] == "completed"
+    assert result["answer_status"] == "insufficient_evidence"
+    assert result["claims"] == []
+    assert result["cited_evidence_ids"] == []
+    assert result["memory_patch"]["evidence_ids"] == []
+    assert result["review"]["verdict"] == "REJECT"
+    assert result["review_attempts"] == 3
+    assert result["safe_fallback"] is True
+    assert len(qa_provider.requests) == 4
+    assert len(review_provider.requests) == 3
+    review_root = workspace / "runs" / result["run_id"] / "review" / "answer"
+    assert sorted(path.name for path in review_root.iterdir()) == ["1", "2", "3"]
 
 
 def test_semantic_answer_review_transient_failure_resumes_without_repeating_qa(
