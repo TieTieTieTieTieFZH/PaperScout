@@ -72,6 +72,22 @@ def load_session(
     if summary != state.summary:
         raise ValueError("Session summary.md does not match state.json")
     messages = _read_message_log(messages_path)
+    turns = session_turns(messages)
+    if state.compacted_turns > len(turns):
+        raise ValueError("Session compacted_turns exceeds the durable message history")
+    if state.summary and state.compacted_turns == 0:
+        inferred_compacted_turns = max(0, len(turns) - RECENT_SESSION_TURNS)
+        if inferred_compacted_turns == 0:
+            raise ValueError("Session summary exists without compacted history")
+        state = state.model_copy(update={"compacted_turns": inferred_compacted_turns})
+    expected_summary = build_session_summary(
+        messages,
+        memory=state.memory,
+        read_resources=state.read_resources,
+        compacted_turns=state.compacted_turns,
+    )
+    if expected_summary != state.summary:
+        raise ValueError("Session summary does not match compacted_turns")
     return state, messages
 
 
@@ -127,7 +143,7 @@ def invalidate_stale_session_resources(
         else:
             stale_resources.append(record)
     if not stale_resources:
-        return state, recent_session_messages(messages), []
+        return state, messages, []
 
     valid_evidence = {
         evidence_id
@@ -157,12 +173,13 @@ def invalidate_stale_session_resources(
                 messages,
                 memory=memory,
                 read_resources=valid_resources,
+                compacted_turns=state.compacted_turns,
             ),
         }
     )
     stale_paths = list(dict.fromkeys(record.path for record in stale_resources))
     context_messages: list[SessionMessage] = []
-    for message in recent_session_messages(messages):
+    for message in messages:
         content = message.content
         if (
             message.role == "tool"
@@ -209,10 +226,12 @@ def build_session_summary(
     *,
     memory: ProjectMemory,
     read_resources: list[ReadResourceRecord],
-    keep_turns: int = RECENT_SESSION_TURNS,
+    compacted_turns: int,
 ) -> str:
     turns = session_turns(messages)
-    compacted = turns[:-keep_turns]
+    if compacted_turns < 0 or compacted_turns > len(turns):
+        raise ValueError("compacted_turns must identify a prefix of the session history")
+    compacted = turns[:compacted_turns]
     if not compacted:
         return ""
     omitted = max(0, len(compacted) - MAX_SUMMARY_TURNS)
@@ -309,6 +328,7 @@ def persist_session(
     expected_message_count: int,
     memory: ProjectMemory,
     read_resources: list[ReadResourceRecord],
+    compacted_turns: int = 0,
 ) -> SessionState:
     path = session_dir(workspace, session_id)
     path.mkdir(parents=True, exist_ok=True)
@@ -329,11 +349,13 @@ def persist_session(
         messages,
         memory=memory,
         read_resources=read_resources,
+        compacted_turns=compacted_turns,
     )
     state = SessionState(
         session_id=session_id,
         project_id=project_id,
         summary=summary,
+        compacted_turns=compacted_turns,
         memory=memory,
         read_resources=read_resources,
     )

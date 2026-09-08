@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,9 +28,16 @@ from paperscout.user_profile import save_user_profile
 
 
 class ScriptedProvider:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        qa_context_window: int | None = None,
+    ) -> None:
         self.responses = iter(responses)
         self.requests: list[list[dict[str, Any]]] = []
+        if qa_context_window is not None:
+            self.settings = SimpleNamespace(qa_context_window=qa_context_window)
 
     def generate_raw_text(self, messages: list[dict[str, Any]]) -> str:
         self.requests.append(messages)
@@ -765,7 +773,68 @@ def test_qa_session_persistence_failure_resumes_without_repeating_model_call(
     assert len((session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
-def test_session_context_keeps_four_turns_and_compacts_old_tool_text(
+def test_session_context_keeps_all_history_below_dynamic_threshold(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    for turn in range(1, 6):
+        result = run_qa(
+            workspace,
+            f"短问题{turn}",
+            "session-below-threshold",
+            provider=ScriptedProvider(
+                [
+                    _final(
+                        answer="简短回答。",
+                        claims=[],
+                        cited_evidence_ids=[],
+                        status="insufficient_evidence",
+                    )
+                ]
+            ),
+        )
+        assert result["status"] == "completed"
+
+    sixth_provider = ScriptedProvider(
+        [
+            _final(
+                answer="简短回答。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+    sixth = run_qa(
+        workspace,
+        "短问题6",
+        "session-below-threshold",
+        provider=sixth_provider,
+    )
+
+    assert sixth["status"] == "completed"
+    retained_user_messages = [
+        message["content"]
+        for message in sixth_provider.requests[0][2:]
+        if message["role"] == "user"
+    ]
+    assert retained_user_messages == [f"短问题{turn}" for turn in range(1, 7)]
+    session_dir = workspace / "memory" / "sessions" / "session-below-threshold"
+    state = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert state.compacted_turns == 0
+    assert state.summary == ""
+    events = [
+        WorkflowEvent.model_validate_json(line)
+        for line in (workspace / "runs" / sixth["run_id"] / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert EventKind.CONTEXT_COMPACTED not in [event.event_type for event in events]
+
+
+def test_session_context_compacts_at_dynamic_threshold_and_keeps_four_turns(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -830,7 +899,8 @@ def test_session_context_keeps_four_turns_and_compacts_old_tool_text(
                 cited_evidence_ids=[],
                 status="insufficient_evidence",
             )
-        ]
+        ],
+        qa_context_window=1_024,
     )
     sixth = run_qa(
         workspace,
@@ -867,15 +937,62 @@ def test_session_context_keeps_four_turns_and_compacts_old_tool_text(
     assert old_tool_text in message_log
     assert old_tool_text not in summary
     assert "问题一" in summary
-    assert "问题2" in summary
+    assert "问题2" not in summary
     assert state.summary == summary
+    assert state.compacted_turns == 1
     events = [
         WorkflowEvent.model_validate_json(line)
         for line in (workspace / "runs" / sixth["run_id"] / "events.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    assert [event.event_type for event in events].count(EventKind.CONTEXT_COMPACTED) == 1
+    compacted_events = [
+        event for event in events if event.event_type == EventKind.CONTEXT_COMPACTED
+    ]
+    assert len(compacted_events) == 1
+    assert compacted_events[0].data["context_window"] == 1_024
+    assert compacted_events[0].data["threshold_tokens"] == 614
+    assert compacted_events[0].data["compacted_turns"] == 1
+    assert compacted_events[0].data["retained_history_turns"] == 4
+
+    larger_window_provider = ScriptedProvider(
+        [
+            _final(
+                answer="当前资料不足。",
+                claims=[],
+                cited_evidence_ids=[],
+                status="insufficient_evidence",
+            )
+        ]
+    )
+    seventh = run_qa(
+        workspace,
+        "问题7",
+        "session-compact",
+        provider=larger_window_provider,
+    )
+
+    assert seventh["status"] == "completed"
+    retained_after_window_growth = [
+        message["content"]
+        for message in larger_window_provider.requests[0][2:]
+        if message["role"] == "user"
+    ]
+    assert retained_after_window_growth == [
+        "问题2",
+        "问题3",
+        "问题4",
+        "问题5",
+        "问题6",
+        "问题7",
+    ]
+    assert old_tool_text not in json.dumps(
+        larger_window_provider.requests[0], ensure_ascii=False
+    )
+    persisted_after_window_growth = SessionState.model_validate_json(
+        (session_dir / "state.json").read_text(encoding="utf-8")
+    )
+    assert persisted_after_window_growth.compacted_turns == 1
 
 
 def test_changed_session_resource_is_invalidated_and_must_be_read_again(

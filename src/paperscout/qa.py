@@ -15,12 +15,14 @@ from .models import (
     AgentKind,
     AgentToolCall,
     EventKind,
+    ProjectMemory,
     QAAnswer,
     QAFinalEnvelope,
     QAGraphState,
     QAToolCallEnvelope,
     ReadBudget,
     ReadProjectFileOutcome,
+    ReadResourceRecord,
     RunStatus,
     SessionMessage,
     WorkflowEvent,
@@ -29,11 +31,13 @@ from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
 from .project_memory import load_project_memory, persist_project_memory
 from .read_tool import model_visible_read_result, read_project_file
 from .session import (
+    build_session_summary,
     load_session,
     merge_project_memory,
     merge_read_resources,
     persist_session,
     invalidate_stale_session_resources,
+    session_turns,
 )
 from .storage import FileSystemStore, read_json, write_json, write_text_atomic
 from .user_profile import load_user_profile
@@ -42,6 +46,9 @@ from .user_profile import load_user_profile
 QAResponseEnvelope = Annotated[QAToolCallEnvelope | QAFinalEnvelope, Field(discriminator="type")]
 QA_RESPONSE_ADAPTER = TypeAdapter(QAResponseEnvelope)
 ANSWER_EVIDENCE_MARK = re.compile(r"\[evidence:([^\]]+)\]")
+DEFAULT_QA_CONTEXT_WINDOW = 128_000
+CONTEXT_COMPACTION_RATIO = 0.60
+MIN_RETAINED_HISTORY_TURNS = 4
 
 
 def parse_qa_model_response(raw_output: str) -> QAToolCallEnvelope | QAFinalEnvelope:
@@ -102,26 +109,128 @@ def _event(
     state.event_sequence = sequence + 1
 
 
-def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
+def _request_messages(
+    *,
+    project_id: str,
+    profile: dict[str, Any],
+    history_summary: str,
+    memory: dict[str, Any],
+    invalidated_resources: list[str],
+    session_messages: list[SessionMessage],
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": QA_SYSTEM_PROMPT},
         {
             "role": "system",
             "content": build_qa_context_prompt(
-                project_id=state.project_id,
-                profile=state.profile.model_dump(mode="json"),
-                history_summary=state.history_summary,
-                memory=state.memory.model_dump(mode="json"),
-                invalidated_resources=state.invalidated_resources,
+                project_id=project_id,
+                profile=profile,
+                history_summary=history_summary,
+                memory=memory,
+                invalidated_resources=invalidated_resources,
             ),
         },
     ]
-    for item in state.messages:
+    for item in session_messages:
         message: dict[str, Any] = {"role": item.role, "content": item.content}
         if item.tool_call_id:
             message["tool_call_id"] = item.tool_call_id
         messages.append(message)
     return messages
+
+
+def _model_messages(state: QAGraphState) -> list[dict[str, Any]]:
+    return _request_messages(
+        project_id=state.project_id,
+        profile=state.profile.model_dump(mode="json"),
+        history_summary=state.history_summary,
+        memory=state.memory.model_dump(mode="json"),
+        invalidated_resources=state.invalidated_resources,
+        session_messages=state.messages,
+    )
+
+
+def estimate_qa_input_tokens(messages: list[dict[str, Any]]) -> int:
+    """Conservatively estimate mixed Chinese/English JSON input without a model tokenizer."""
+    payload = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return max(1, (len(payload.encode("utf-8")) + 2) // 3)
+
+
+def _provider_qa_context_window(provider: Any) -> int:
+    context_window = getattr(
+        getattr(provider, "settings", None),
+        "qa_context_window",
+        DEFAULT_QA_CONTEXT_WINDOW,
+    )
+    if (
+        isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window < 1
+    ):
+        raise ValueError("qa_context_window must be a positive integer")
+    return context_window
+
+
+def _select_history_context(
+    *,
+    history: list[SessionMessage],
+    previously_compacted_turns: int,
+    current_message: SessionMessage,
+    profile: dict[str, Any],
+    project_id: str,
+    memory: ProjectMemory,
+    read_resources: list[ReadResourceRecord],
+    invalidated_resources: list[str],
+    context_window: int,
+) -> tuple[list[SessionMessage], str, int, int, int]:
+    turns = session_turns(history)
+    if previously_compacted_turns > len(turns):
+        raise ValueError("Session compacted history exceeds the durable message log")
+    threshold_tokens = max(1, int(context_window * CONTEXT_COMPACTION_RATIO))
+    maximum_compacted_turns = max(
+        previously_compacted_turns,
+        len(turns) - MIN_RETAINED_HISTORY_TURNS,
+    )
+    selected_messages: list[SessionMessage] = []
+    selected_summary = ""
+    selected_compacted_turns = previously_compacted_turns
+    estimated_tokens = 0
+    for compacted_turns in range(
+        previously_compacted_turns,
+        maximum_compacted_turns + 1,
+    ):
+        summary = build_session_summary(
+            history,
+            memory=memory,
+            read_resources=read_resources,
+            compacted_turns=compacted_turns,
+        )
+        retained = [
+            message
+            for turn in turns[compacted_turns:]
+            for message in turn
+        ]
+        request = _request_messages(
+            project_id=project_id,
+            profile=profile,
+            history_summary=summary,
+            memory=memory.model_dump(mode="json"),
+            invalidated_resources=invalidated_resources,
+            session_messages=[*retained, current_message],
+        )
+        selected_messages = retained
+        selected_summary = summary
+        selected_compacted_turns = compacted_turns
+        estimated_tokens = estimate_qa_input_tokens(request)
+        if estimated_tokens <= threshold_tokens:
+            break
+    return (
+        selected_messages,
+        selected_summary,
+        selected_compacted_turns,
+        len(turns) - selected_compacted_turns,
+        estimated_tokens,
+    )
 
 
 def _new_state(
@@ -131,6 +240,7 @@ def _new_state(
     project_id: str,
     llm_mode: str,
     read_budget: ReadBudget | None,
+    qa_context_window: int,
 ) -> QAGraphState:
     profile = load_user_profile(store.workspace)
     project = load_project_memory(store.workspace, project_id)
@@ -140,7 +250,7 @@ def _new_state(
         project_id=project_id,
     )
     loaded_session_memory = session.memory
-    session, recent_history, invalidated_resources = invalidate_stale_session_resources(
+    session, context_history, invalidated_resources = invalidate_stale_session_resources(
         store.workspace,
         session,
         history,
@@ -162,6 +272,24 @@ def _new_state(
                 ]
             }
         )
+    current_message = _message("user", question)
+    (
+        retained_history,
+        history_summary,
+        compacted_turns,
+        retained_history_turns,
+        estimated_input_tokens,
+    ) = _select_history_context(
+        history=context_history,
+        previously_compacted_turns=session.compacted_turns,
+        current_message=current_message,
+        profile=profile.model_dump(mode="json"),
+        project_id=project_id,
+        memory=memory,
+        read_resources=session.read_resources,
+        invalidated_resources=invalidated_resources,
+        context_window=qa_context_window,
+    )
     run_id = uuid.uuid4().hex
     state = QAGraphState(
         run_id=run_id,
@@ -172,16 +300,21 @@ def _new_state(
         question=question,
         llm_mode=llm_mode,
         status=RunStatus.RUNNING,
-        messages=[*recent_history, _message("user", question)],
+        messages=[*retained_history, current_message],
         profile=profile,
-        history_summary=session.summary,
+        history_summary=history_summary,
         memory=memory,
         session_read_resources=session.read_resources,
         invalidated_resources=invalidated_resources,
         invalidated_evidence_ids=invalidated_evidence_ids,
         session_message_count=len(history),
+        context_compacted_turns=compacted_turns,
+        retained_history_turns=retained_history_turns,
+        qa_context_window=qa_context_window,
+        context_threshold_tokens=max(1, int(qa_context_window * CONTEXT_COMPACTION_RATIO)),
+        estimated_input_tokens=estimated_input_tokens,
         read_budget=read_budget or ReadBudget(),
-        turn_start_message_index=len(recent_history),
+        turn_start_message_index=len(retained_history),
     )
     _event(
         store,
@@ -193,9 +326,30 @@ def _new_state(
             "project_id": project_id,
             "invalidated_resources": invalidated_resources,
             "invalidated_evidence_ids": invalidated_evidence_ids,
+            "context_window": qa_context_window,
+            "threshold_tokens": state.context_threshold_tokens,
+            "estimated_input_tokens": estimated_input_tokens,
+            "compacted_turns": compacted_turns,
+            "retained_history_turns": retained_history_turns,
         },
         agent=AgentKind.QA,
     )
+    if compacted_turns > session.compacted_turns:
+        _event(
+            store,
+            state,
+            EventKind.CONTEXT_COMPACTED,
+            "qa",
+            "Compacted older QA turns before the next model input",
+            {
+                "context_window": qa_context_window,
+                "threshold_tokens": state.context_threshold_tokens,
+                "estimated_input_tokens": estimated_input_tokens,
+                "compacted_turns": compacted_turns,
+                "retained_history_turns": retained_history_turns,
+            },
+            agent=AgentKind.QA,
+        )
     return state
 
 
@@ -429,19 +583,10 @@ def build_qa_graph(
                 expected_message_count=state.session_message_count,
                 memory=project.memory,
                 read_resources=session_resources,
+                compacted_turns=state.context_compacted_turns,
             )
         except Exception as exc:
             raise RetryableNodeError(f"QA memory persistence failed: {exc}") from exc
-        if session.summary != state.history_summary:
-            _event(
-                store,
-                state,
-                EventKind.CONTEXT_COMPACTED,
-                state.current_node,
-                "Compacted older QA turns into the session summary",
-                {"retained_turns": 4},
-                agent=AgentKind.QA,
-            )
         result = {
             "status": "completed",
             "run_id": state.run_id,
@@ -595,6 +740,7 @@ def run_qa(
 ) -> dict[str, Any]:
     store = FileSystemStore(workspace)
     selected_provider = provider or _provider(llm_mode)
+    qa_context_window = _provider_qa_context_window(selected_provider)
     state = _new_state(
         store,
         question,
@@ -602,6 +748,7 @@ def run_qa(
         project_id,
         llm_mode,
         read_budget,
+        qa_context_window,
     )
     try:
         with GraphRuntime.open(store.workspace) as runtime:

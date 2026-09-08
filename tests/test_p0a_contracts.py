@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
 from paperscout.graph_runtime import GraphRuntime, graph_config
+from paperscout.llm import LLMSettings
 from paperscout.models import (
     AgentKind,
     EventKind,
@@ -61,6 +62,7 @@ def test_session_and_graph_states_are_strict_contracts(tmp_path: Path) -> None:
     project = ProjectState(project_id="default")
     profile = UserProfile()
     assert session.project_id == "default"
+    assert session.compacted_turns == 0
     assert session.memory.evidence_ids == []
     assert project.memory.evidence_ids == []
     assert profile.answer_style_preferences == []
@@ -87,6 +89,18 @@ def test_session_and_graph_states_are_strict_contracts(tmp_path: Path) -> None:
         ProjectState.model_validate({"project_id": "default", "unknown": True})
     with pytest.raises(ValidationError):
         UserProfile.model_validate({"unknown": True})
+
+
+def test_llm_settings_load_independent_qa_context_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INGEST_LLM_CONTEXT_WINDOW", "64000")
+    monkeypatch.setenv("QA_LLM_CONTEXT_WINDOW", "32000")
+
+    settings = LLMSettings.from_env()
+
+    assert settings.ingest_context_window == 64_000
+    assert settings.qa_context_window == 32_000
 
 
 def test_event_contract_requires_correlation_and_known_event_type() -> None:

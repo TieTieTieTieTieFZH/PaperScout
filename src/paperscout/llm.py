@@ -16,6 +16,7 @@ class LLMSettings:
     disable_response_storage: bool = True
     wire_api: str = "responses"
     ingest_context_window: int = 128_000
+    qa_context_window: int = 128_000
 
     @classmethod
     def from_env(cls) -> "LLMSettings":
@@ -27,6 +28,7 @@ class LLMSettings:
             disable_response_storage=os.getenv("PAPERSCOUT_LLM_DISABLE_RESPONSE_STORAGE", "true").lower() == "true",
             wire_api=os.getenv("PAPERSCOUT_LLM_WIRE_API", cls.wire_api),
             ingest_context_window=int(os.getenv("INGEST_LLM_CONTEXT_WINDOW", str(cls.ingest_context_window))),
+            qa_context_window=int(os.getenv("QA_LLM_CONTEXT_WINDOW", str(cls.qa_context_window))),
         )
 
 
