@@ -31,6 +31,19 @@ WIKI_REVIEW_SYSTEM_PROMPT = """你是 PaperScout 的 Wiki Review Chat Client。
 - 第一行之后用自然语言列出具体问题；不要输出 JSON 或代码围栏。"""
 
 
+ANSWER_REVIEW_SYSTEM_PROMPT = """你是 PaperScout 的 Answer Review Chat Client。
+
+你只审核当前 QA 回答是否忠实受到宿主提供的 section evidence 支持，并且确实回答了用户问题。
+
+规则：
+- 不调用工具、不读取文件、不使用记忆，也不补充宿主未提供的事实。
+- 检查回答是否混淆论文、夸大局部结果、把研究假设写成论文事实，或忽略任务、数据集和指标差异。
+- 只依据本次消息中的用户问题、完整 QA 回答和其实际引用的 Evidence。
+- 第一行必须且只能是 VERDICT: APPROVE、VERDICT: REVISE 或 VERDICT: REJECT。
+- APPROVE 表示回答受到证据支持且无需修改；REVISE 表示可按意见修改；REJECT 表示主要内容不受证据支持。
+- 第一行之后用自然语言列出具体问题；不要输出 JSON 或代码围栏。"""
+
+
 QA_SYSTEM_PROMPT = """你是 PaperScout 的只读 QA Agent。
 
 你只能通过 read_project_file 读取项目资料，不能修改 wiki、raw 或任何项目文件。通常按 Wiki 入口、论文 Wiki、section evidence、raw 的顺序渐进读取；用户明确要求原文时可以直接读取 evidence 或 raw。
@@ -95,6 +108,27 @@ def build_wiki_review_prompt(*, paper: dict[str, Any], candidate_markdown: str, 
         f"【论文】\nPaper ID: {paper['paper_id']}\nTitle: {paper.get('title', '未知标题')}\n\n"
         f"【待审核 Wiki】\n--- WIKI START ---\n{candidate_markdown}\n--- WIKI END ---\n\n"
         f"【候选实际引用的 Evidence】\n--- EVIDENCE START ---\n{evidence_document}\n--- EVIDENCE END ---"
+    )
+
+
+def build_answer_review_prompt(
+    *,
+    question: str,
+    answer: str,
+    evidence: list[dict[str, Any]],
+) -> str:
+    evidence_document = "\n\n".join(
+        f"--- EVIDENCE {item['evidence_id']} START ---\n"
+        f"Path: {item['path']}\n\n{item['content']}\n"
+        f"--- EVIDENCE {item['evidence_id']} END ---"
+        for item in evidence
+    )
+    return (
+        "请审核下面的 QA 回答。\n\n"
+        f"【用户问题】\n--- QUESTION START ---\n{question}\n--- QUESTION END ---\n\n"
+        f"【QA 回答】\n--- ANSWER START ---\n{answer}\n--- ANSWER END ---\n\n"
+        "【回答实际引用的 Evidence】\n"
+        f"{evidence_document or '（无引用 Evidence）'}"
     )
 
 

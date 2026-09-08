@@ -8,7 +8,11 @@ from typing import Annotated, Any
 from langgraph.graph import END, START, StateGraph
 from pydantic import Field, TypeAdapter, ValidationError
 
-from .answer_review import validate_answer_rules, verify_answer_review_evidence
+from .answer_review import (
+    collect_answer_review_evidence,
+    validate_answer_rules,
+    verify_answer_review_evidence,
+)
 from .graph_runtime import GraphRuntime, RetryableNodeError, graph_config
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
 from .models import (
@@ -29,9 +33,15 @@ from .models import (
     SessionMessage,
     WorkflowEvent,
 )
-from .prompts import QA_SYSTEM_PROMPT, build_qa_context_prompt
+from .prompts import (
+    ANSWER_REVIEW_SYSTEM_PROMPT,
+    QA_SYSTEM_PROMPT,
+    build_answer_review_prompt,
+    build_qa_context_prompt,
+)
 from .project_memory import load_project_memory, persist_project_memory
 from .read_tool import model_visible_read_result, read_project_file
+from .review import parse_review_response
 from .session import (
     build_session_summary,
     load_session,
@@ -64,6 +74,14 @@ def parse_qa_model_response(raw_output: str) -> QAToolCallEnvelope | QAFinalEnve
 
 
 def _provider(mode: str) -> Any:
+    if mode == "mock":
+        return MockLLM()
+    if mode == "real":
+        return OpenAICompatibleResponsesLLM()
+    raise ValueError("llm_mode must be 'mock' or 'real'")
+
+
+def _answer_review_provider(mode: str) -> Any:
     if mode == "mock":
         return MockLLM()
     if mode == "real":
@@ -358,9 +376,11 @@ def build_qa_graph(
     runtime: GraphRuntime,
     *,
     provider: Any,
+    review_provider: Any | None = None,
     interrupt_before: list[str] | None = None,
 ):
     """Compile the QA model/tool loop against the owned SQLite checkpointer."""
+    review_provider = review_provider or MockLLM()
 
     def model_node(state: QAGraphState) -> dict[str, Any]:
         state.current_node = "qa_agent"
@@ -441,6 +461,7 @@ def build_qa_graph(
                 "rule_review": None,
                 "answer_evidence_hashes": {},
                 "review": None,
+                "attempt": max(1, state.attempt),
                 "model_steps": state.model_steps + 1,
                 "last_error": None,
             }
@@ -592,11 +613,129 @@ def build_qa_graph(
                 "last_error": str(exc),
             }
 
+    def answer_review_node(state: QAGraphState) -> dict[str, Any]:
+        state.current_node = "answer_review"
+        store = FileSystemStore(Path(state.workspace))
+        audit = store.run_dir(state.run_id) / "review" / "answer" / str(state.attempt)
+        try:
+            if state.candidate_answer is None:
+                raise ValueError("QA final answer is missing")
+            if state.rule_review is None or state.rule_review.verdict != ReviewVerdict.APPROVE:
+                raise RuntimeError("Answer candidate has not passed deterministic review")
+            evidence = collect_answer_review_evidence(
+                store.workspace,
+                state.candidate_answer.cited_evidence_ids,
+            )
+            current_hashes = {item.evidence_id: item.sha256 for item in evidence}
+            if current_hashes != state.answer_evidence_hashes:
+                raise RuntimeError("Answer Review evidence changed before semantic review")
+            evidence_ids = [item.evidence_id for item in evidence]
+            request = build_answer_review_prompt(
+                question=state.question,
+                answer=state.candidate_answer.answer,
+                evidence=[item.model_dump(mode="json") for item in evidence],
+            )
+            request_path = audit / "request.md"
+            response_path = audit / "response.md"
+            result_path = audit / "result.json"
+            if audit.exists():
+                if not audit.is_dir() or audit.is_symlink():
+                    raise ValueError("Answer review audit path must be a normal directory")
+                if not request_path.is_file() or request_path.read_text(encoding="utf-8") != request:
+                    raise RuntimeError("Answer review replay request does not match its durable audit")
+            else:
+                audit.mkdir(parents=True)
+                write_text_atomic(request_path, request)
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_STARTED,
+                state.current_node,
+                "Requesting semantic Answer Review",
+                {"attempt": state.attempt, "evidence_ids": evidence_ids},
+                agent=AgentKind.ANSWER_REVIEW,
+            )
+            replayed = False
+            if result_path.is_file():
+                payload = read_json(result_path)
+                if (
+                    payload.get("review_type") != "answer"
+                    or payload.get("attempt") != state.attempt
+                    or payload.get("evidence_ids") != evidence_ids
+                ):
+                    raise RuntimeError("Answer review result does not match its durable audit")
+                decision = ReviewDecision.model_validate(payload.get("decision"))
+                replayed = True
+            else:
+                if response_path.is_file():
+                    response = response_path.read_text(encoding="utf-8")
+                    replayed = True
+                else:
+                    try:
+                        response = review_provider.generate_raw_text(
+                            [
+                                {"role": "system", "content": ANSWER_REVIEW_SYSTEM_PROMPT},
+                                {"role": "user", "content": request},
+                            ]
+                        )
+                        write_text_atomic(response_path, response)
+                    except Exception as exc:
+                        raise RetryableNodeError(
+                            f"Answer review model call failed: {exc}"
+                        ) from exc
+                decision = parse_review_response(response)
+                write_json(
+                    result_path,
+                    {
+                        "review_type": "answer",
+                        "attempt": state.attempt,
+                        "evidence_ids": evidence_ids,
+                        "decision": decision.model_dump(mode="json"),
+                    },
+                )
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_COMPLETED,
+                state.current_node,
+                "Completed semantic Answer Review",
+                {
+                    "attempt": state.attempt,
+                    "verdict": decision.verdict.value,
+                    "replayed": replayed,
+                },
+                agent=AgentKind.ANSWER_REVIEW,
+            )
+            error = None
+            if decision.verdict != ReviewVerdict.APPROVE:
+                error = (
+                    f"Semantic Answer Review returned {decision.verdict.value}; "
+                    "answer revision is not implemented"
+                )
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "review": decision.model_dump(mode="json"),
+                "last_error": error,
+            }
+        except RetryableNodeError:
+            raise
+        except Exception as exc:
+            if audit.is_dir() and not (audit / "result.json").exists():
+                write_json(audit / "result.json", {"status": "failed", "error": str(exc)})
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "last_error": str(exc),
+            }
+
     def verify_answer_evidence_node(state: QAGraphState) -> dict[str, Any]:
         state.current_node = "verify_answer_evidence"
         try:
             if state.rule_review is None or state.rule_review.verdict != ReviewVerdict.APPROVE:
                 raise RuntimeError("Answer candidate has not passed deterministic review")
+            if state.review is None or state.review.verdict != ReviewVerdict.APPROVE:
+                raise RuntimeError("Answer candidate has not passed semantic review")
             verify_answer_review_evidence(
                 Path(state.workspace),
                 state.answer_evidence_hashes,
@@ -657,6 +796,7 @@ def build_qa_graph(
             "answer_status": answer.status.value,
             "memory_patch": answer.memory_patch.model_dump(mode="json"),
             "rule_review": state.rule_review.model_dump(mode="json"),
+            "review": state.review.model_dump(mode="json"),
             "read_resources": [record.model_dump(mode="json") for record in state.read_resources],
             "read_budget": state.read_budget.model_dump(mode="json"),
         }
@@ -690,6 +830,8 @@ def build_qa_graph(
         }
         if state.rule_review is not None:
             result["rule_review"] = state.rule_review.model_dump(mode="json")
+        if state.review is not None:
+            result["review"] = state.review.model_dump(mode="json")
         _event(store, state, EventKind.RUN_FAILED, state.current_node, error, agent=AgentKind.QA)
         store.write_result(state.run_id, result)
         return {
@@ -715,6 +857,7 @@ def build_qa_graph(
     builder.add_node("qa_agent", model_node)
     builder.add_node("read_project_file", tool_node)
     builder.add_node("answer_rules", answer_rules_node)
+    builder.add_node("answer_review", answer_review_node)
     builder.add_node("verify_answer_evidence", verify_answer_evidence_node)
     builder.add_node("complete_qa", complete_node)
     builder.add_node("fail_qa", fail_node)
@@ -731,6 +874,11 @@ def build_qa_graph(
     )
     builder.add_conditional_edges(
         "answer_rules",
+        route_error,
+        {"continue": "answer_review", "fail": "fail_qa"},
+    )
+    builder.add_conditional_edges(
+        "answer_review",
         route_error,
         {"continue": "verify_answer_evidence", "fail": "fail_qa"},
     )
@@ -802,11 +950,13 @@ def run_qa(
     *,
     project_id: str = "default",
     provider: Any | None = None,
+    review_provider: Any | None = None,
     read_budget: ReadBudget | None = None,
     interrupt_before: list[str] | None = None,
 ) -> dict[str, Any]:
     store = FileSystemStore(workspace)
     selected_provider = provider or _provider(llm_mode)
+    selected_review_provider = review_provider or _answer_review_provider(llm_mode)
     qa_context_window = _provider_qa_context_window(selected_provider)
     state = _new_state(
         store,
@@ -822,6 +972,7 @@ def run_qa(
             graph = build_qa_graph(
                 runtime,
                 provider=selected_provider,
+                review_provider=selected_review_provider,
                 interrupt_before=interrupt_before,
             )
             config = graph_config(state.thread_id)
@@ -856,6 +1007,7 @@ def resume_qa(
     llm_mode: str = "mock",
     *,
     provider: Any | None = None,
+    review_provider: Any | None = None,
 ) -> dict[str, Any]:
     store = FileSystemStore(workspace)
     config = graph_config(thread_id)
@@ -874,7 +1026,12 @@ def resume_qa(
         if state.llm_mode != llm_mode:
             raise ValueError(f"QA checkpoint requires llm_mode={state.llm_mode}")
         selected_provider = provider or _provider(llm_mode)
-        graph = build_qa_graph(runtime, provider=selected_provider)
+        selected_review_provider = review_provider or _answer_review_provider(llm_mode)
+        graph = build_qa_graph(
+            runtime,
+            provider=selected_provider,
+            review_provider=selected_review_provider,
+        )
         _event(
             store,
             state,

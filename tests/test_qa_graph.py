@@ -1515,3 +1515,210 @@ def test_answer_evidence_change_after_rules_fails_before_session_persistence(
     assert not (
         workspace / "memory" / "sessions" / "answer-rule-hash-session"
     ).exists()
+
+
+def test_semantic_answer_review_approve_is_isolated_and_audited(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call("answer-review-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+    review_provider = ScriptedProvider(
+        ["VERDICT: APPROVE\n\n未发现需要修改的问题。"]
+    )
+
+    result = run_qa(
+        workspace,
+        "论文的方法是什么？",
+        "semantic-answer-review-session",
+        provider=qa_provider,
+        review_provider=review_provider,
+    )
+
+    assert result["status"] == "completed"
+    assert result["review"] == {
+        "verdict": "APPROVE",
+        "feedback": ["未发现需要修改的问题。"],
+    }
+    assert len(qa_provider.requests) == 2
+    assert len(review_provider.requests) == 1
+    assert [message["role"] for message in review_provider.requests[0]] == ["system", "user"]
+    review_request = review_provider.requests[0][1]["content"]
+    assert "论文的方法是什么？" in review_request
+    assert "论文记录了方法。 [evidence:paper-1:s0001]" in review_request
+    assert "原文方法描述。" in review_request
+    audit = workspace / "runs" / result["run_id"] / "review" / "answer" / "1"
+    assert (audit / "request.md").read_text(encoding="utf-8") == review_request
+    assert (audit / "response.md").read_text(encoding="utf-8").startswith(
+        "VERDICT: APPROVE"
+    )
+    assert json.loads((audit / "result.json").read_text(encoding="utf-8")) == {
+        "review_type": "answer",
+        "attempt": 1,
+        "evidence_ids": ["paper-1:s0001"],
+        "decision": {
+            "verdict": "APPROVE",
+            "feedback": ["未发现需要修改的问题。"],
+        },
+    }
+    events = [
+        json.loads(line)
+        for line in (workspace / "runs" / result["run_id"] / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    semantic_review_events = [
+        event
+        for event in events
+        if event["node"] == "answer_review"
+    ]
+    assert [event["event_type"] for event in semantic_review_events] == [
+        "review.started",
+        "review.completed",
+    ]
+    assert {event["agent"] for event in semantic_review_events} == {"answer_review"}
+
+
+def test_semantic_answer_review_invalid_verdict_fails_closed(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call("answer-review-invalid-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    result = run_qa(
+        workspace,
+        "方法？",
+        "semantic-answer-review-invalid-session",
+        provider=qa_provider,
+        review_provider=ScriptedProvider(["可以返回。"]),
+    )
+
+    assert result["status"] == "failed"
+    assert "first line must be VERDICT" in result["error"]
+    assert not (
+        workspace / "memory" / "sessions" / "semantic-answer-review-invalid-session"
+    ).exists()
+    audit = workspace / "runs" / result["run_id"] / "review" / "answer" / "1"
+    failed = json.loads((audit / "result.json").read_text(encoding="utf-8"))
+    assert failed["status"] == "failed"
+
+
+@pytest.mark.parametrize("verdict", ["REVISE", "REJECT"])
+def test_semantic_answer_review_non_approval_cannot_return_answer(
+    tmp_path: Path,
+    verdict: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call(f"answer-review-{verdict.lower()}-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    result = run_qa(
+        workspace,
+        "方法？",
+        f"semantic-answer-review-{verdict.lower()}-session",
+        provider=qa_provider,
+        review_provider=ScriptedProvider(
+            [f"VERDICT: {verdict}\n\n回答需要进一步处理。"]
+        ),
+    )
+
+    assert result["status"] == "failed"
+    assert result["review"]["verdict"] == verdict
+    assert "answer revision is not implemented" in result["error"]
+    assert not (
+        workspace
+        / "memory"
+        / "sessions"
+        / f"semantic-answer-review-{verdict.lower()}-session"
+    ).exists()
+
+
+def test_semantic_answer_review_transient_failure_resumes_without_repeating_qa(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    qa_provider = ScriptedProvider(
+        [
+            _tool_call("answer-review-resume-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    interrupted = run_qa(
+        workspace,
+        "方法？",
+        "semantic-answer-review-resume-session",
+        provider=qa_provider,
+        review_provider=ScriptedProvider([]),
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["answer_review"]
+    audit = workspace / "runs" / interrupted["run_id"] / "review" / "answer" / "1"
+    assert (audit / "request.md").is_file()
+    assert not (audit / "response.md").exists()
+
+    resumed_review = ScriptedProvider(["VERDICT: APPROVE\n\n审核通过。"])
+    result = resume_qa(
+        workspace,
+        interrupted["thread_id"],
+        provider=ScriptedProvider([]),
+        review_provider=resumed_review,
+    )
+
+    assert result["status"] == "completed"
+    assert len(qa_provider.requests) == 2
+    assert len(resumed_review.requests) == 1

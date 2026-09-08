@@ -93,6 +93,8 @@ class MockLLM:
                 },
                 ensure_ascii=False,
             )
+        if "Answer Review Chat Client" in text:
+            return "VERDICT: APPROVE\n\n未发现需要修改的问题。"
         if "Wiki Review Chat Client" in text:
             return "VERDICT: APPROVE\n\n未发现需要修改的问题。"
         evidence_ids = re.findall(r"<!-- evidence:([^\s|]+)", text)
