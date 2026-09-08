@@ -1464,3 +1464,54 @@ def test_missing_user_profile_is_empty_non_mutating_and_invalid_profile_fails(
             "invalid-profile-session",
             provider=ScriptedProvider([]),
         )
+
+
+def test_answer_evidence_change_after_rules_fails_before_session_persistence(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    provider = ScriptedProvider(
+        [
+            _tool_call("answer-rule-read", "wiki/papers/paper-1.md"),
+            _final(
+                answer="论文记录了方法。 [evidence:paper-1:s0001]",
+                claims=[
+                    {
+                        "text": "论文记录了方法。",
+                        "type": "paper_fact",
+                        "paper_ids": ["paper-1"],
+                        "evidence_ids": ["paper-1:s0001"],
+                    }
+                ],
+                cited_evidence_ids=["paper-1:s0001"],
+            ),
+        ]
+    )
+
+    interrupted = run_qa(
+        workspace,
+        "论文的方法是什么？",
+        "answer-rule-hash-session",
+        provider=provider,
+        interrupt_before=["verify_answer_evidence"],
+    )
+
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["next_nodes"] == ["verify_answer_evidence"]
+    evidence_path = workspace / "wiki" / "evidence" / "paper-1" / "s0001.md"
+    evidence_path.write_text(
+        evidence_path.read_text(encoding="utf-8") + "\n审核后发生变化。\n",
+        encoding="utf-8",
+    )
+
+    result = resume_qa(
+        workspace,
+        interrupted["thread_id"],
+        provider=ScriptedProvider([]),
+    )
+
+    assert result["status"] == "failed"
+    assert "changed after deterministic review" in result["error"]
+    assert not (
+        workspace / "memory" / "sessions" / "answer-rule-hash-session"
+    ).exists()

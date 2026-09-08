@@ -114,6 +114,18 @@ class ReviewDecision(BaseModel):
     feedback: list[str] = Field(default_factory=list)
 
 
+class AnswerReviewEvidence(BaseModel):
+    """One current section-evidence document supplied to Answer Review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(min_length=1)
+    paper_id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: str = Field(min_length=1)
+
+
 class ReadProjectFileArguments(BaseModel):
     """Canonical arguments for the QA agent's only read-only tool."""
 
@@ -459,6 +471,8 @@ class QAGraphState(BaseModel):
     turn_start_message_index: int = Field(default=0, ge=0)
     current_tool_calls: list[AgentToolCall] = Field(default_factory=list)
     candidate_answer: QAAnswer | None = None
+    rule_review: ReviewDecision | None = None
+    answer_evidence_hashes: dict[str, str] = Field(default_factory=dict)
     review: ReviewDecision | None = None
     attempt: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)

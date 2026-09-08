@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from pathlib import Path
 from typing import Annotated, Any
@@ -9,6 +8,7 @@ from typing import Annotated, Any
 from langgraph.graph import END, START, StateGraph
 from pydantic import Field, TypeAdapter, ValidationError
 
+from .answer_review import validate_answer_rules, verify_answer_review_evidence
 from .graph_runtime import GraphRuntime, RetryableNodeError, graph_config
 from .llm import MockLLM, OpenAICompatibleResponsesLLM
 from .models import (
@@ -23,6 +23,8 @@ from .models import (
     ReadBudget,
     ReadProjectFileOutcome,
     ReadResourceRecord,
+    ReviewDecision,
+    ReviewVerdict,
     RunStatus,
     SessionMessage,
     WorkflowEvent,
@@ -45,7 +47,6 @@ from .user_profile import load_user_profile
 
 QAResponseEnvelope = Annotated[QAToolCallEnvelope | QAFinalEnvelope, Field(discriminator="type")]
 QA_RESPONSE_ADAPTER = TypeAdapter(QAResponseEnvelope)
-ANSWER_EVIDENCE_MARK = re.compile(r"\[evidence:([^\]]+)\]")
 DEFAULT_QA_CONTEXT_WINDOW = 128_000
 CONTEXT_COMPACTION_RATIO = 0.60
 MIN_RETAINED_HISTORY_TURNS = 4
@@ -423,6 +424,9 @@ def build_qa_graph(
                         ).model_dump(mode="json")
                     ],
                     "candidate_answer": None,
+                    "rule_review": None,
+                    "answer_evidence_hashes": {},
+                    "review": None,
                     "model_steps": state.model_steps + 1,
                     "last_error": None,
                 }
@@ -434,6 +438,9 @@ def build_qa_graph(
                 "messages": [message.model_dump(mode="json") for message in messages],
                 "current_tool_calls": [],
                 "candidate_answer": answer.model_dump(mode="json"),
+                "rule_review": None,
+                "answer_evidence_hashes": {},
+                "review": None,
                 "model_steps": state.model_steps + 1,
                 "last_error": None,
             }
@@ -523,26 +530,77 @@ def build_qa_graph(
                 "last_error": str(exc),
             }
 
-    def validate_answer_node(state: QAGraphState) -> dict[str, Any]:
-        state.current_node = "validate_answer"
+    def answer_rules_node(state: QAGraphState) -> dict[str, Any]:
+        state.current_node = "answer_rules"
+        store = FileSystemStore(Path(state.workspace))
+        _event(
+            store,
+            state,
+            EventKind.REVIEW_STARTED,
+            state.current_node,
+            "Running deterministic Answer Review rules",
+            agent=AgentKind.HOST,
+        )
         try:
             if state.candidate_answer is None:
                 raise ValueError("QA final answer is missing")
-            observed = {
-                evidence_id
-                for record in state.read_resources
-                for evidence_id in record.evidence_ids
+            decision, evidence = validate_answer_rules(
+                workspace=store.workspace,
+                question=state.question,
+                answer=state.candidate_answer,
+                read_resources=state.read_resources,
+            )
+            evidence_hashes = {item.evidence_id: item.sha256 for item in evidence}
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_COMPLETED,
+                state.current_node,
+                "Completed deterministic Answer Review rules",
+                {
+                    "verdict": decision.verdict.value,
+                    "evidence_ids": list(evidence_hashes),
+                },
+                agent=AgentKind.HOST,
+            )
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "rule_review": decision.model_dump(mode="json"),
+                "answer_evidence_hashes": evidence_hashes,
+                "last_error": None,
             }
-            cited = set(state.candidate_answer.cited_evidence_ids)
-            unknown = sorted(cited - observed)
-            if unknown:
-                raise ValueError(f"answer cites evidence not observed in tool results: {unknown}")
-            memory_unknown = sorted(set(state.candidate_answer.memory_patch.evidence_ids) - observed)
-            if memory_unknown:
-                raise ValueError(f"memory patch cites evidence not observed in tool results: {memory_unknown}")
-            body_citations = set(ANSWER_EVIDENCE_MARK.findall(state.candidate_answer.answer))
-            if body_citations != cited:
-                raise ValueError("answer body evidence markers must match cited_evidence_ids")
+        except Exception as exc:
+            decision = ReviewDecision(
+                verdict=ReviewVerdict.REJECT,
+                feedback=[str(exc)],
+            )
+            _event(
+                store,
+                state,
+                EventKind.REVIEW_COMPLETED,
+                state.current_node,
+                "Deterministic Answer Review rules rejected the candidate",
+                {"verdict": decision.verdict.value, "error": str(exc)},
+                agent=AgentKind.HOST,
+            )
+            return {
+                "current_node": state.current_node,
+                "event_sequence": state.event_sequence,
+                "rule_review": decision.model_dump(mode="json"),
+                "answer_evidence_hashes": {},
+                "last_error": str(exc),
+            }
+
+    def verify_answer_evidence_node(state: QAGraphState) -> dict[str, Any]:
+        state.current_node = "verify_answer_evidence"
+        try:
+            if state.rule_review is None or state.rule_review.verdict != ReviewVerdict.APPROVE:
+                raise RuntimeError("Answer candidate has not passed deterministic review")
+            verify_answer_review_evidence(
+                Path(state.workspace),
+                state.answer_evidence_hashes,
+            )
             return {"current_node": state.current_node, "last_error": None}
         except Exception as exc:
             return {"current_node": state.current_node, "last_error": str(exc)}
@@ -598,6 +656,7 @@ def build_qa_graph(
             "cited_evidence_ids": answer.cited_evidence_ids,
             "answer_status": answer.status.value,
             "memory_patch": answer.memory_patch.model_dump(mode="json"),
+            "rule_review": state.rule_review.model_dump(mode="json"),
             "read_resources": [record.model_dump(mode="json") for record in state.read_resources],
             "read_budget": state.read_budget.model_dump(mode="json"),
         }
@@ -629,6 +688,8 @@ def build_qa_graph(
             "error": error,
             "read_budget": state.read_budget.model_dump(mode="json"),
         }
+        if state.rule_review is not None:
+            result["rule_review"] = state.rule_review.model_dump(mode="json")
         _event(store, state, EventKind.RUN_FAILED, state.current_node, error, agent=AgentKind.QA)
         store.write_result(state.run_id, result)
         return {
@@ -653,14 +714,15 @@ def build_qa_graph(
     builder = StateGraph(QAGraphState)
     builder.add_node("qa_agent", model_node)
     builder.add_node("read_project_file", tool_node)
-    builder.add_node("validate_answer", validate_answer_node)
+    builder.add_node("answer_rules", answer_rules_node)
+    builder.add_node("verify_answer_evidence", verify_answer_evidence_node)
     builder.add_node("complete_qa", complete_node)
     builder.add_node("fail_qa", fail_node)
     builder.add_edge(START, "qa_agent")
     builder.add_conditional_edges(
         "qa_agent",
         route_model,
-        {"tool": "read_project_file", "answer": "validate_answer", "fail": "fail_qa"},
+        {"tool": "read_project_file", "answer": "answer_rules", "fail": "fail_qa"},
     )
     builder.add_conditional_edges(
         "read_project_file",
@@ -668,7 +730,12 @@ def build_qa_graph(
         {"continue": "qa_agent", "fail": "fail_qa"},
     )
     builder.add_conditional_edges(
-        "validate_answer",
+        "answer_rules",
+        route_error,
+        {"continue": "verify_answer_evidence", "fail": "fail_qa"},
+    )
+    builder.add_conditional_edges(
+        "verify_answer_evidence",
         route_error,
         {"continue": "complete_qa", "fail": "fail_qa"},
     )

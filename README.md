@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件、同一 Session 多轮继续、约 60% 窗口阈值的动态上下文压缩、同一项目下跨 Session 共享的文件型长期记忆，以及跨项目只读用户 Profile；Answer Review 仍在开发。
+- 当前 Wiki Ingest 与基础 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件、同一 Session 多轮继续、约 60% 窗口阈值的动态上下文压缩、同一项目下跨 Session 共享的文件型长期记忆、跨项目只读用户 Profile，以及 Answer Review 的确定性规则层；语义 Answer Review 仍在开发。
 - QA 只使用宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；模型只看到精简 JSON 外壳与自然语言正文，哈希和完整预算信息保留在宿主审计中。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
@@ -114,7 +114,9 @@ result = resume_qa(
 )
 ```
 
-QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、本轮重复调用 ID 或未读 Evidence 引用会失败关闭。`project_id` 是可选关键字参数，默认值为 `default`，因此现有调用保持兼容；同一 `project_id` 下的不同 Session 通过 `memory/projects/{project_id}/state.json` 共享研究目标、论文指代、确认决策、未解决问题和研究假设，同一 `session_id` 不能切换到另一项目。全局 `memory/profile.json` 只保存研究方向、回答风格和引用偏好；必须由用户或宿主显式调用 `save_user_profile()` 维护，QA 只读取，模型协议不接受 `profile_patch`。
+QA 模型每轮只能返回严格 JSON 工具调用或最终回答。宿主执行工具并记录完整审计结果；无效参数和预算错误会回填模型，非法 JSON、未知工具、本轮重复调用 ID 或未读 Evidence 引用会失败关闭。候选答案还必须通过显式 `answer_rules` 节点：实际引用的每条 Evidence 都要定位到当前 `wiki/evidence/{paper_id}/{section_id}.md`，文件必须声明相同 ID；用户明确索要原文或依据时不得返回无引用的非“证据不足”答案。规则通过后、Session 落盘前会再次核对 Evidence 哈希。当前尚未接入独立语义 Answer Review，因此离线通过只证明这些确定性约束。
+
+`project_id` 是可选关键字参数，默认值为 `default`，因此现有调用保持兼容；同一 `project_id` 下的不同 Session 通过 `memory/projects/{project_id}/state.json` 共享研究目标、论文指代、确认决策、未解决问题和研究假设，同一 `session_id` 不能切换到另一项目。全局 `memory/profile.json` 只保存研究方向、回答风格和引用偏好；必须由用户或宿主显式调用 `save_user_profile()` 维护，QA 只读取，模型协议不接受 `profile_patch`。
 
 完成的轮次会把项目记忆与 Session 分别原子写入；Session 自身仍使用 `memory/sessions/{session_id}/messages.jsonl`、`state.json` 和 `summary.md` 保存完整消息审计、压缩边界、摘要和已读资源元数据。宿主按 `QA_LLM_CONTEXT_WINDOW` 配置的模型窗口，以序列化 UTF-8 字节数执行保守 token 估算：预计下一轮输入超过约 60% 时从最早轮次开始压缩，始终至少保留最近四轮；低于阈值时保留全部尚未压缩的历史。已压缩边界只前进不回退，旧工具正文只保存在完整消息审计中，不会在窗口变大后重新进入模型；摘要保留有效资源的路径、SHA256 和 Evidence ID。加载 Session 时还会重新核对资源 SHA256，变化、缺失或越界的资源会失效并要求本轮重新读取。该估算不等同于 Provider 的精确 tokenizer，部署时应把窗口配置为所用模型的真实值；`mock` 只验证确定性控制流，真实问答质量仍需使用 `real` 单独人工评测。
 
