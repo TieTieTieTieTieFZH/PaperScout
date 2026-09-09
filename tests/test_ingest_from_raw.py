@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from paperscout.events import replay_workflow_events
 from paperscout.graph_runtime import GraphRuntime, graph_config
 from paperscout.models import (
     AgentKind,
@@ -123,10 +124,12 @@ def test_ingest_resumes_after_checkpointed_model_interrupt_once(
     assert result["status"] == "published"
     assert resumed_provider.calls == 1
     events_path = tmp_path / "runs" / result["run_id"] / "events.jsonl"
-    events = [WorkflowEvent.model_validate_json(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    replay = replay_workflow_events(tmp_path, result["run_id"])
+    events = replay.events
     assert [event.sequence for event in events] == list(range(len(events)))
     assert EventKind.RUN_INTERRUPTED in [event.event_type for event in events]
     assert EventKind.RUN_RESUMED in [event.event_type for event in events]
+    assert replay.terminal is True
 
     event_count = len(events)
     no_call_provider = SequenceProvider([])

@@ -5,7 +5,7 @@ PaperScout 是一个基于文件系统的学术论文知识流水线。它接收
 ## 当前功能
 
 - 支持 Python 3.11、`uv` 和 Pydantic。
-- 当前 Wiki Ingest 与 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具/Review 故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件、同一 Session 多轮继续、约 60% 窗口阈值的动态上下文压缩、同一项目下跨 Session 共享的文件型长期记忆、跨项目只读用户 Profile，以及确定性规则与独立语义 Answer Review 双阶段审核、审核驱动补读/重答和最大次数安全降级。
+- 当前 Wiki Ingest 与 QA Agent Loop 均由 LangGraph `StateGraph` 编排并使用 SQLite Checkpointer；支持节点边界中断、瞬时模型/工具/Review 故障后续跑和宿主文件副作用幂等恢复。QA 已支持用户可读 Session 文件、同一 Session 多轮继续、约 60% 窗口阈值的动态上下文压缩、同一项目下跨 Session 共享的文件型长期记忆、跨项目只读用户 Profile，以及确定性规则与独立语义 Answer Review 双阶段审核、审核驱动补读/重答和最大次数安全降级。Ingest 与 QA 的事件日志可通过公开 API 严格回放或按序号增量读取。
 - QA 只使用宿主只读 `read_project_file`：只允许 `wiki/` 与 `raw/papers/`，执行严格参数、路径和读取预算校验；模型只看到精简 JSON 外壳与自然语言正文，哈希和完整预算信息保留在宿主审计中。
 - `run_ingest` 支持两种 MinerU 输入方式：
   - 传入 `mineru_path`：使用本地 MinerU 解析结果；
@@ -70,6 +70,29 @@ Token 也可以通过 `mineru_token` 参数传入。项目不会将 Token 写入
 宿主只使用当前论文的 `mineru/content_list.json`，按 `type: text`、`text_level: 2` 聚合 section evidence。Evidence ID 使用二级标题在原始数组中的下标，例如 `<paper_id>:s0042`。Ingest 是无工具 Chat Client；输入必须一次性完整装入预算，若简单前缀会发生截断则失败关闭，在失败结果和 Checkpoint 中记录结构化覆盖信息，不生成不完整 Wiki。
 
 ## Python API
+
+### 读取与回放工作流事件
+
+```python
+from pathlib import Path
+from paperscout import read_workflow_events, replay_workflow_events
+
+workspace = Path("./paper-workspace")
+replay = replay_workflow_events(workspace, "<run_id>")
+for event in replay.events:
+    print(event.sequence, event.event_type.value, event.message)
+
+page = read_workflow_events(workspace, "<run_id>", after_sequence=-1, limit=100)
+while page.has_more:
+    page = read_workflow_events(
+        workspace,
+        "<run_id>",
+        after_sequence=page.next_after_sequence,
+        limit=100,
+    )
+```
+
+`replay_workflow_events()` 返回一次运行的完整、严格校验后的事件序列及 `running`、`interrupted`、`completed` 或 `failed` 状态。`read_workflow_events()` 使用排他性 `after_sequence` 游标分页，单页上限为 1000；`terminal` 表示磁盘上当前完整事件流是否已经结束，消费者即使看到终态也应先用 `has_more` 排空剩余分页。读取器会拒绝不安全的 `run_id`、越界或符号链接路径、非法 JSON、断裂序号、重复事件 ID、关联字段变化及终态后的事件，不会对损坏日志进行猜测性修复。当前 API 用于持久化回放和轮询式增量读取，尚不提供主动推送或长连接流式传输。
 
 ### 使用 QA Agent 渐进读取项目资料
 

@@ -169,7 +169,9 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 ### 4.6 事件
 
-`WorkflowEvent` 强制携带运行关联信息并限制事件类型。当前 Ingest 和 QA 均写入运行、模型、中断、恢复及终态事件，QA 还写入工具、上下文压缩、确定性 Answer 规则和语义 Answer Review 开始/完成事件；事件序号会在恢复时与磁盘记录对齐。流式消费与事件回放仍未完成。
+`WorkflowEvent` 强制携带运行关联信息并限制事件类型。当前 Ingest 和 QA 均写入运行、模型、中断、恢复及终态事件，QA 还写入工具、上下文压缩、确定性 Answer 规则和语义 Answer Review 开始/完成事件；事件序号会在恢复时与磁盘记录对齐。
+
+`events.py` 提供公开的 `replay_workflow_events()` 和 `read_workflow_events()`。完整回放会在返回前验证日志非空、首事件为 `run.started`、序号从 0 连续、`run_id`/`thread_id`/`session_id` 在整次运行中一致、事件 ID 唯一且终态后无事件；任何损坏均失败关闭。增量读取在同一完整性验证之上使用排他性 `after_sequence` 游标和 1–1000 的分页上限，并返回下一游标、是否仍有缓存事件、当前运行状态和终态标记。路径解析只允许工作区 `runs/{run_id}/events.jsonl` 的普通目录和普通文件。该 API 可以稳定回放或轮询持久化事件，但尚未实现主动推送式前端流消费。
 
 ## 5. 实际执行顺序
 
@@ -220,6 +222,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `src/paperscout/review.py` | 严格解析 Review 第一行状态，并把自然语言意见转换为 `ReviewDecision`。 | Wiki Review 与 Answer Review 共用同一失败关闭机制。 |
 | `src/paperscout/read_tool.py` | 实现 QA 唯一宿主只读工具：Schema、允许根目录、路径穿越/符号链接防护、文件类型、文本截断、资源哈希、读取预算和精简模型可见结果。 | 已接入 QA Graph；越界 Windows reparse point 已通过 junction 回退实测。 |
 | `src/paperscout/answer_review.py` | 执行 Answer Review 确定性规则，安全收集候选实际引用的当前 section Evidence，并在返回前复核哈希。 | 规则与 Evidence 输入契约已完成；语义审核与修订由 QA Graph 编排。 |
+| `src/paperscout/events.py` | 严格加载、校验和回放单次运行的 JSONL 事件，并提供基于排他性序号游标的增量分页读取。 | 持久化回放与轮询读取已完成；主动推送式前端流消费未实现。 |
 | `src/paperscout/user_profile.py` | 严格加载并显式原子保存 `memory/profile.json`，缺失时返回空 Profile。 | 用户/宿主显式维护、QA 只读、跨项目加载和未知 `profile_patch` 拒绝已接入。 |
 | `src/paperscout/project_memory.py` | 校验项目记忆路径，严格加载并原子保存 `memory/projects/{project_id}/state.json`。 | 可选 `project_id="default"`、跨 Session 共享、项目隔离和写后故障幂等恢复已接入。 |
 | `src/paperscout/session.py` | 校验 Session 路径与项目绑定，严格加载/原子保存三文件契约，合并记忆与已读资源元数据，失效陈旧资源，投影无被拒草稿的模型历史，并构造无旧工具正文的结构化摘要。 | 用户可读文件、多轮继续、审核审计隔离、单调压缩边界、资源哈希失效和项目绑定已接入。 |
@@ -240,6 +243,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 | `tests/test_review_contract.py` | 验证严格 verdict 第一行解析及未知、缺失或错位状态全部失败关闭。 | 是。 |
 | `tests/test_read_project_file.py` | 验证文本/目录读取、offset/截断、预算、路径范围、资源元数据、Schema 和结构化错误；符号链接不可用时以 Windows junction 实测越界 reparse point。 | 是。 |
 | `tests/test_answer_review.py` | 验证只收集实际引用 Evidence、文件/ID 失败关闭、显式依据请求规则和返回前哈希复核。 | 是。 |
+| `tests/test_workflow_events.py` | 验证完整回放、增量游标分页、运行状态推导、路径保护及损坏/断裂日志失败关闭。 | 是。 |
 | `tests/test_qa_graph.py` | 验证精简工具结果、严格模型 JSON、渐进读取、引用失败关闭、节点中断/瞬时故障恢复、模型/工具/Review 持久化重放、预算不重复计费、终态幂等 resume、Session 三文件、多轮继续、路径保护、写后故障幂等恢复、动态压缩与四轮下限、资源哈希失效重读、项目记忆共享/隔离/恢复、用户 Profile 跨项目只读加载，以及 Answer Review 隔离、审计、修订补读、安全降级和被拒草稿上下文隔离。 | 是。 |
 | `tests/fixtures/mineru_micro/content_list.json` | 最小确定性 MinerU fixture，覆盖二级章节和 Evidence 构造。 | 被自动测试读取。 |
 | `tests/manual_raw_to_wiki.py` | 使用本机已有 raw 手动运行真实或 Mock Ingest。 | 否，需人工调用。 |
@@ -273,7 +277,7 @@ References 章节仍保存在 Evidence 中以保证 raw 可追溯，但标为不
 
 当前 P0 可信闭环已完成，剩余架构缺口集中在运行可观测性和真实服务评测：
 
-1. 补齐事件流式消费和回放；
+1. 基于稳定事件读取 API 补齐前端主动流式消费；
 2. 使用真实 MinerU 与真实 LLM 执行语义质量、上下文缩减比例、Review 修复率和恢复成功率评测。
 
 每一步都应先添加 fixture 和关键契约测试，再实现功能，并在同一提交中更新 `docs/refactor-progress.md`。

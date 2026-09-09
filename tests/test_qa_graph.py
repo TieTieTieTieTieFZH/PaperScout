@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from paperscout.events import replay_workflow_events
 from paperscout.graph_runtime import GraphRuntime, graph_config
 from paperscout.models import (
     AgentToolCall,
@@ -222,10 +223,13 @@ def test_qa_resumes_at_tool_boundary_without_duplicate_side_effects(tmp_path: Pa
     tools = list((workspace / "runs" / result["run_id"] / "tools").iterdir())
     assert len(tools) == 1
     events_path = workspace / "runs" / result["run_id"] / "events.jsonl"
-    events = [WorkflowEvent.model_validate_json(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    replay = replay_workflow_events(workspace, result["run_id"])
+    events = replay.events
     assert [event.sequence for event in events] == list(range(len(events)))
     assert EventKind.RUN_INTERRUPTED in [event.event_type for event in events]
     assert EventKind.RUN_RESUMED in [event.event_type for event in events]
+    assert replay.session_id == "session-resume"
+    assert replay.terminal is True
 
     event_count = len(events)
     no_call_provider = ScriptedProvider([])

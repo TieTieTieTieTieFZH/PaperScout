@@ -18,7 +18,7 @@
 
 | 项目 | 当前结果 | 实现是否已验证 | 验证方式 |
 | --- | --- | --- | --- |
-| 离线测试集 | 102 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q`；越界 reparse point 在普通 symlink 不可用时通过 Windows junction 回退实测 |
+| 离线测试集 | 120 tests | 本地自动验证 | `.venv\Scripts\python.exe -m pytest -q`；越界 reparse point 在普通 symlink 不可用时通过 Windows junction 回退实测 |
 | 依赖锁一致性 | 通过 | 本地自动验证 | `uv --no-cache lock --check`（绕开本机全局 uv cache 路径冲突，不改变校验语义） |
 | 补丁空白/冲突标记 | 通过 | 本地自动验证 | `git diff --check` |
 | Windows GitHub Actions | main 推送后触发 | 未验证 | `.github/workflows/ci.yml`：`uv sync --frozen --group dev`，随后 `uv run pytest -q` |
@@ -41,7 +41,7 @@
 | P0-D1 SQLite Checkpointer 与恢复 | 已完成 | Ingest/QA 显式节点前中断、瞬时模型/Review/工具故障保留可恢复 Checkpoint、`resume_ingest`/`resume_qa`、运行环境校验、终态幂等返回、模型/Review/工具持久化重放、原子审计写、staging 重建、发布清单校验与两个原子替换崩溃窗口恢复。 | 本地自动验证 | `tests/test_ingest_from_raw.py`：28 passed；`tests/test_qa_graph.py`：13 passed；覆盖 runtime reconstruction、原子文件替换、预算不重复计费、发布回滚和 raw 不变性 | 宿主文件副作用已幂等；若进程在远程模型返回但结果尚未持久化的极短窗口崩溃，Provider 请求可能重发，除非 Provider 支持幂等键。 |
 | P0-D2 Session、压缩与记忆 | 已完成 | 用户可读 Session 三文件原子写入；安全 Profile/Session/项目路径；用户/宿主显式维护且 QA 只读的 `memory/profile.json`；可选 `project_id="default"`；跨 Session 项目记忆共享与跨项目隔离；Session 项目绑定；记忆/资源合并去重；`QA_LLM_CONTEXT_WINDOW` 独立配置；下一轮输入的保守 token 估算达到约 60% 时动态压缩最早历史；至少保留最近四轮；压缩边界单调持久化；旧工具正文不回流模型；加载时重新核对资源哈希并强制重新读取；`context.compacted` 事件；项目/Session 写后故障从 `complete_qa` 幂等续跑且不重复消息或模型调用。 | 本地自动验证 | `tests/test_qa_graph.py`：三文件、多轮继续、路径保护、写后故障恢复、阈值以下保留、阈值压缩、四轮下限、资源失效、项目记忆共享/隔离/恢复，以及 Profile 跨项目加载、只读、缺失与损坏文件测试；`tests/test_p0a_contracts.py`：独立 QA 窗口配置 | 无；精确 token 数取决于具体 Provider tokenizer，当前按文档采用确定性保守估算。 |
 | P0-E Answer Review | 已完成 | 显式 `answer_rules`、独立 `answer_review`、`revise_answer`、`safe_answer` 与返回前 `verify_answer_evidence` 节点；只安全收集实际引用的当前 section Evidence；独立、无工具、无 Session Provider 审核问题、完整回答和实际引用 Evidence；严格解析首行 verdict；`APPROVE` 放行；`REVISE/REJECT` 驱动 QA 补读或完整重答并重新执行两层审核；初稿后最多修复两次，仍不通过则返回无 Claim/引用/记忆补丁的证据不足答案；非法输出失败关闭；逐次保存 request/response/result；Review 结果进入完整 Session 审计而被拒草稿不回流下一轮模型；Provider 瞬时故障可续跑且不重复 QA；最终哈希变化不保存 Session。 | 本地自动验证 | `tests/test_answer_review.py`：4 passed；`tests/test_review_contract.py`：5 passed；`tests/test_qa_graph.py`：35 passed，覆盖隔离、审计、事件、失败关闭、续跑、修订、补读、上限降级和历史投影 | 真实 LLM 语义审核与修订质量未人工验证。 |
-| P1 事件与可观测性 | 部分实现 | Ingest 与 QA 严格 JSONL 运行/模型、中断、恢复及终态事件；QA 工具、上下文压缩、确定性 Answer 规则及语义 Answer Review 开始/完成事件；压缩事件携带窗口、阈值、估算 token 和保留轮数；恢复后序号连续。 | 本地自动验证 | Ingest/QA 恢复事件序列、动态压缩、Answer 规则和语义 Review 事件测试 | 流式消费和回放未实现；节点重试事件语义当前为 at-least-once。 |
+| P1 事件与可观测性 | 部分实现 | Ingest 与 QA 严格 JSONL 运行/模型、中断、恢复及终态事件；QA 工具、上下文压缩、确定性 Answer 规则及语义 Answer Review 开始/完成事件；压缩事件携带窗口、阈值、估算 token 和保留轮数；恢复后序号连续；公开 API 支持完整严格回放和基于排他性序号游标的增量分页读取，验证路径、连续序号、唯一事件 ID、运行关联与终态边界。 | 本地自动验证 | `tests/test_workflow_events.py`：18 passed；Ingest/QA 真实运行日志回放断言；全量 pytest | 主动推送式前端流消费未实现；节点重试事件语义当前为 at-least-once。 |
 | 旧核心逻辑清理 | 已完成 | 移除旧 Evidence、ReadRaw、QA、迁移和旧 `state.json` 路径；保留导入、MinerU、raw 和发布边界。 | 本地自动验证 | 全量 pytest；旧符号与路径静态检索 | 无；后续不新增兼容层。 |
 
 ## 4. 已完成切片与提交证据
@@ -68,7 +68,8 @@
 | 2026-09-08 | `457dc55` | 完成 P0-D2 独立 QA 窗口配置、约 60% 动态压缩、四轮保留下限、单调压缩边界和可审计估算数据。 | QA 专项 27 passed；契约与 QA 专项 33 passed；完整离线基线 90 passed；依赖锁与补丁格式检查通过。 |
 | 2026-09-08 | `dddfd71` | 完成 P0-E 确定性 Answer Review 规则、实际引用 Evidence 收集契约和返回前哈希复核。 | Answer Review 专项 4 passed；Answer Review、QA 与契约专项 38 passed；完整离线基线 95 passed；依赖锁与补丁格式检查通过。 |
 | 2026-09-08 | `c83913f` | 完成 P0-E 独立语义 Answer Review `APPROVE` 审核门、逐次审计、严格 verdict 失败关闭和瞬时故障恢复。 | 语义 Answer Review 专项 5 passed；Answer Review/Review/QA 专项 44 passed；完整离线基线 100 passed；依赖锁与补丁格式检查通过。 |
-| 2026-09-08 | （本提交） | 完成 P0-E `REVISE/REJECT` 补读/重答循环、两次修复上限、安全证据不足降级、Review Session 审计和被拒草稿上下文隔离。 | QA 专项 35 passed；完整离线基线 102 passed；依赖锁与补丁格式检查通过。 |
+| 2026-09-08 | `92aa442` | 完成 P0-E `REVISE/REJECT` 补读/重答循环、两次修复上限、安全证据不足降级、Review Session 审计和被拒草稿上下文隔离。 | QA 专项 35 passed；完整离线基线 102 passed；依赖锁与补丁格式检查通过。 |
+| 2026-09-09 | （本提交） | 为 JSONL 审计新增严格完整回放与游标分页读取 API，覆盖安全运行路径、序号/关联/终态完整性校验，并接入现有 Ingest/QA 恢复日志测试。 | 事件专项 18 passed；Ingest/QA 联合专项 20 passed；完整离线基线 120 passed；依赖锁与补丁格式检查通过。 |
 
 ## 5. 项目经历表述验收
 
@@ -83,4 +84,4 @@
 
 ## 6. 下一步
 
-下一最小切片进入 P1 事件与可观测性：先为现有 `events.jsonl` 增加稳定的读取/回放 API 和契约测试，再评估前端流式消费；真实 MinerU/LLM 语义质量仍需单独人工评测。
+下一最小切片继续 P1 事件与可观测性：基于稳定读取/回放 API 设计主动流式消费边界，并明确节点重试的 at-least-once 语义；真实 MinerU/LLM 语义质量仍需单独人工评测。

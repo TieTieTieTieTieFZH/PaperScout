@@ -520,3 +520,27 @@ class WorkflowEvent(BaseModel):
     node: str | None = None
     message: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowEventStreamStatus(str, Enum):
+    RUNNING = "running"
+    INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class WorkflowEventReplay(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    thread_id: str = Field(min_length=1)
+    session_id: str | None = None
+    status: WorkflowEventStreamStatus
+    terminal: bool
+    events: list[WorkflowEvent]
+
+
+class WorkflowEventPage(WorkflowEventReplay):
+    after_sequence: int = Field(ge=-1)
+    next_after_sequence: int = Field(ge=-1)
+    has_more: bool
